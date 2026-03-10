@@ -201,8 +201,10 @@ function Get-TargetCimSession {
     $cimOpts = @{ ComputerName = $TargetComputer; ErrorAction = 'Stop' }
     if ($Credential) { $cimOpts['Credential'] = $Credential }
 
-    # Try WSMan first (port 5985), then DCOM
-    foreach ($proto in @('Wsman', 'Dcom')) {
+    # Try DCOM first (TCP 135 + dynamic RPC) — this is the transport Flexera Beacon
+    # uses for Win32_Process.Create. WSMan (WinRM/5985) is attempted as a fallback
+    # only; a WSMan-only success would indicate the Beacon path may still be broken.
+    foreach ($proto in @('Dcom', 'Wsman')) {
         try {
             $sessionOpt = New-CimSessionOption -Protocol $proto
             $cimOpts['SessionOption'] = $sessionOpt
@@ -212,7 +214,7 @@ function Get-TargetCimSession {
             # Try next protocol
         }
     }
-    throw "Unable to establish CIM session via WSMan or DCOM to $TargetComputer"
+    throw "Unable to establish CIM session via DCOM or WSMan to $TargetComputer"
 }
 
 <#
@@ -512,8 +514,14 @@ function Test-RemoteExecution {
     try {
         $null = Get-TargetCimSession
         $proto = $Script:CimSession.Protocol
-        Add-Result -Category 'WMI/CIM' -Test 'CIM session established' -Result $PASS `
-            -Detail "Connected via $proto"
+        if ($proto -eq 'Dcom') {
+            Add-Result -Category 'WMI/CIM' -Test 'CIM session established' -Result $PASS `
+                -Detail "Connected via DCOM (matches Flexera Beacon transport)"
+        } else {
+            Add-Result -Category 'WMI/CIM' -Test 'CIM session established' -Result $WARN `
+                -Detail "Connected via $proto — DCOM failed, fell back to WSMan. Flexera Beacon uses DCOM; this result may not reflect real inventory behaviour." `
+                -Hint 'Check TCP 135 and dynamic RPC port range (49152-65535) to the target. DCOM Launch/Activation permissions in Component Services may also be blocking.'
+        }
     } catch {
         Add-Result -Category 'WMI/CIM' -Test 'CIM session established' -Result $FAIL `
             -Detail $_.Exception.Message `
