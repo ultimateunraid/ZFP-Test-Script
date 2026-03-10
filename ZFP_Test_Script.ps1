@@ -1,5 +1,4 @@
-
-#Requires -Version 5.1
+﻿#Requires -Version 5.1
 <#
 .SYNOPSIS
     Diagnostic script for Flexera Zero Footprint Agent (ZFA) / Zero Footprint Inventory (ZFP)
@@ -26,37 +25,13 @@
 
 .NOTES
     Author  : Gabe (IT Infrastructure)
-    Version : 2.2
+    Version : 1.0
     Requires: PowerShell 5.1+, run elevated on the machine performing the scan.
     Target  : Windows hosts (Flexera FNMS 2023 R2 ZFA requirements)
 
     Reference:
         https://docs.flexera.com/FlexNetManagerSuite2023R2/EN/GatherFNInv/index.html
         #SysRef/FlexNetInventoryAgent/topics/ZFA-SystemReqs.html
-
-    ── IMPROVEMENT NOTES vs prior version ──────────────────────────────────────────
-    [+] CIM sessions (Get-CimInstance / New-CimSession) replace deprecated Get-WmiObject.
-        CIM tries WSMAN first then falls back to DCOM — more reliable across environments.
-    [+] Test-NetConnection replaces raw socket code for port tests (cleaner, built-in).
-    [+] Result objects are structured [PSCustomObject] throughout — pipe to Export-Csv etc.
-    [+] HTML report for sharing with firewall/network teams.
-    [+] Timeout guard on WMI remote process waits (prevents indefinite hangs).
-    [+] PS 5.1 compatible — no null-coalescing (??), ternary (? :), or null-conditional (?.)
-
-    ── v2.2 CHANGES ────────────────────────────────────────────────────────────────
-    [fix] Removed dead $DiagDirRemoteAdmin variable (never referenced).
-    [fix] Admin$ now mounted as a persistent PSDrive (Mount-AdminShare) for the full
-          run so Read-RemoteTextViaAdmin and staged copies use the same authenticated
-          session rather than mixing credential and no-credential UNC access.
-    [fix] Test-CShareRead now closes the FileStream in a finally block (was leaking handle).
-    [fix] Invoke-NdtrackLocalStaged now checks $proc.Launched before reading output files.
-    [fix] Null-check order in prerequisite guards uses ($null -ne $x) to be strict-mode safe.
-    [new] Elevation check at startup — exits immediately with a clear message if not admin.
-    [new] Optional PowerShell transcript ($TranscriptPath) for full session capture.
-    [new] Optional remote temp dir cleanup after the run ($CleanupRemoteDiagDir, default $true).
-    [new] Section 4/5 (target-side checks) now gated on remote exec only; tracker.log
-          (Section 6) gated on Admin$ only — the two prerequisites are evaluated independently.
-    ────────────────────────────────────────────────────────────────────────────────
 #>
 
 #region ── USER CONFIGURATION ────────────────────────────────────────────────────
@@ -69,8 +44,15 @@ $TargetComputer      = 'WORKSTATION01'
 $BeaconHostname      = 'BEACON01'
 
 # Hostname, FQDN, or IP of the server hosting ManageSoftRL.
-# The full upload URL is built automatically: http://<value>/ManageSoftRL
 $UploadServer        = 'BEACON01'
+
+# Protocol for the UploadLocation URL: 'http' or 'https'
+$UploadProtocol      = 'http'
+
+# Port for the UploadLocation URL.
+# Standard defaults: 80 (http) or 443 (https). Set a custom value if needed.
+# If using the default port for the chosen protocol it will be omitted from the URL.
+$UploadPort          = 80
 
 # Username for Admin$ / WMI authentication (e.g. 'DOMAIN\username' or 'hostname\localadmin').
 # Leave empty ('') to run under the current user context without a password prompt.
@@ -78,6 +60,11 @@ $CredentialUsername  = 'DOMAIN\username'
 
 # Path to ndtrack.exe relative to \\BeaconHostname\mgsRET$
 $NdtrackRelativePath = 'Inventory\ndtrack.exe'
+
+# Additional arguments passed to ndtrack.exe during the execution test.
+# The script always supplies -t Machine and -o UploadLocation automatically.
+# Add or remove -o arguments here as needed for your environment.
+$NdtrackExtraArgs    = '-o LogModules=default -o IgnoreConnectionWindows=true'
 
 # Set to $true to copy ndtrack.exe locally to the target and run it from there.
 # Useful when UNC execution is blocked by AppLocker/WDAC/EDR.
@@ -90,14 +77,6 @@ $SkipNdtrackExecution = $false
 # Example: 'C:\Diag\ZFP_WORKSTATION01.html'
 $HtmlReportPath      = ''
 
-# Set to $true to remove the remote temp folder from the target after the run.
-# Set to $false to keep files in place for manual debugging.
-$CleanupRemoteDiagDir = $true
-
-# Optional: full path to write a PowerShell transcript of this run. Leave empty '' to skip.
-# Example: 'C:\Diag\ZFP_WORKSTATION01_transcript.txt'
-$TranscriptPath       = ''
-
 # Temp directory created on the target for capturing command output files.
 $RemoteDiagDir       = 'C:\Windows\Temp\FlexeraZFPDiag'
 
@@ -108,11 +87,21 @@ $ErrorActionPreference = 'Stop'
 
 #region ── DERIVED VARIABLES & STATE ─────────────────────────────────────────────────────
 
-# Build the full UploadLocation URL from the server value set above.
-$UploadLocation = "http://$UploadServer/ManageSoftRL"
+# Build the full UploadLocation URL from the config values above.
+$defaultPort = (($UploadProtocol -eq 'https') -and ($UploadPort -eq 443)) -or (($UploadProtocol -eq 'http') -and ($UploadPort -eq 80))
+if ($defaultPort) {
+    $UploadLocation = "${UploadProtocol}://${UploadServer}/ManageSoftRL"
+} else {
+    $UploadLocation = "${UploadProtocol}://${UploadServer}:${UploadPort}/ManageSoftRL"
+}
+# Test endpoint — returns "Test succeeded" on a healthy beacon
+$UploadTestURL  = "$UploadLocation/test"
 
 # Build the full ndtrack UNC path.
 $NdtrackUNC     = "\\$BeaconHostname\mgsRET`$\$NdtrackRelativePath"
+
+# Admin$ path used for reading captured output files off the target.
+$DiagDirRemoteAdmin = $RemoteDiagDir -replace '^C:\\Windows\\', "\\$TargetComputer\Admin`$\"
 
 # Prompt for password if a username was supplied; otherwise run as current user.
 if ($CredentialUsername -ne '') {
@@ -122,9 +111,9 @@ if ($CredentialUsername -ne '') {
     $Credential = $null
 }
 
-$Script:Results        = [System.Collections.Generic.List[PSObject]]::new()
-$Script:AdminDriveName = $null   # PSDrive name if Admin$ is persistently mounted
-$Script:CimSession     = $null   # Reusable CIM session
+$Script:Results      = [System.Collections.Generic.List[PSObject]]::new()
+$Script:AdminDrive   = $null   # PSDrive letter if Admin$ is mapped
+$Script:CimSession   = $null   # Reusable CIM session
 
 $PASS  = 'PASS'
 $WARN  = 'WARN'
@@ -201,10 +190,8 @@ function Get-TargetCimSession {
     $cimOpts = @{ ComputerName = $TargetComputer; ErrorAction = 'Stop' }
     if ($Credential) { $cimOpts['Credential'] = $Credential }
 
-    # Try DCOM first (TCP 135 + dynamic RPC) — this is the transport Flexera Beacon
-    # uses for Win32_Process.Create. WSMan (WinRM/5985) is attempted as a fallback
-    # only; a WSMan-only success would indicate the Beacon path may still be broken.
-    foreach ($proto in @('Dcom', 'Wsman')) {
+    # Try WSMan first (port 5985), then DCOM
+    foreach ($proto in @('Wsman', 'Dcom')) {
         try {
             $sessionOpt = New-CimSessionOption -Protocol $proto
             $cimOpts['SessionOption'] = $sessionOpt
@@ -214,7 +201,7 @@ function Get-TargetCimSession {
             # Try next protocol
         }
     }
-    throw "Unable to establish CIM session via DCOM or WSMan to $TargetComputer"
+    throw "Unable to establish CIM session via WSMan or DCOM to $TargetComputer"
 }
 
 <#
@@ -292,7 +279,10 @@ function Invoke-RemoteCapturedProcess {
     $stderrFile = "$RemoteDiagDir\${Tag}.stderr.txt"
     $exitFile   = "$RemoteDiagDir\${Tag}.exit.txt"
 
-    $wrapped = "cmd /c `"$InnerCommand`" > `"$stdoutFile`" 2> `"$stderrFile`" & echo %errorlevel% > `"$exitFile`""
+    # Do NOT wrap $InnerCommand in outer quotes — it carries its own quoting.
+    # Use "call echo %errorlevel%" — plain echo expands %errorlevel% at parse time
+    # (before InnerCommand runs), so always captures the wrong exit code.
+    $wrapped = "C:\Windows\System32\cmd.exe /c $InnerCommand > `"$stdoutFile`" 2> `"$stderrFile`" & call echo %errorlevel% > `"$exitFile`""
 
     $launchResult = Invoke-RemoteCimProcess -CommandLine $wrapped -Description $Tag
     if ($launchResult.ReturnCode -ne 0) {
@@ -333,45 +323,43 @@ function Invoke-RemoteCapturedProcess {
 
 <#
 .DESCRIPTION
-    Maps \\Target\Admin$ to a persistent PSDrive (ZFPDiag:) for the lifetime of
-    the script run, using $Credential when provided. Subsequent UNC reads and
-    copies all route through this authenticated drive so credentials are applied
-    consistently. The drive is removed in Invoke-Cleanup.
-    Returns $true on success, $false on failure.
+    Maps \\Target\Admin$ to a temporary PSDrive and runs a scriptblock within that
+    context, then removes the drive. Returns whatever the scriptblock returns.
+    Caches the drive letter in $Script:AdminDrive for reuse within one session.
 #>
-function Mount-AdminShare {
-    $driveName = 'ZFPDiag'
-    if (Get-PSDrive -Name $driveName -ErrorAction SilentlyContinue) {
-        $Script:AdminDriveName = $driveName
-        return $true
-    }
-    $mapArgs = @{ Name = $driveName; PSProvider = 'FileSystem'; Root = "\\$TargetComputer\Admin$"; ErrorAction = 'Stop' }
+function Use-AdminShareDrive {
+    param([scriptblock]$Action)
+    $driveLetter = 'ZFPDiag'
+    $unc         = "\\$TargetComputer\Admin$"
+
+    $mapArgs = @{ Name = $driveLetter; PSProvider = 'FileSystem'; Root = $unc; ErrorAction = 'Stop' }
     if ($Credential) { $mapArgs['Credential'] = $Credential }
+
     try {
-        New-PSDrive @mapArgs | Out-Null
-        $Script:AdminDriveName = $driveName
-        return $true
-    } catch {
-        $Script:AdminDriveName = $null
-        return $false
+        if (-not (Get-PSDrive -Name $driveLetter -ErrorAction SilentlyContinue)) {
+            New-PSDrive @mapArgs | Out-Null
+        }
+        $Script:AdminDrive = "${driveLetter}:"
+        return (& $Action)
+    } finally {
+        if (Get-PSDrive -Name $driveLetter -ErrorAction SilentlyContinue) {
+            Remove-PSDrive -Name $driveLetter -Force -ErrorAction SilentlyContinue
+            $Script:AdminDrive = $null
+        }
     }
 }
 
 <#
 .DESCRIPTION
-    Reads a remote file back via Admin$ (C:\Windows\... → Admin$\...).
-    Uses the persistent PSDrive (ZFPDiag:) when mounted so that credential-based
-    authentication is applied consistently; falls back to raw UNC otherwise.
+    Reads a remote file back via Admin$ (C:\Windows\... → \\Target\Admin$\...).
     Returns the content as a string, or $null on failure.
 #>
 function Read-RemoteTextViaAdmin {
     param([string]$RemotePath)   # e.g. C:\Windows\Temp\FlexeraZFPDiag\foo.txt
-    $relative = $RemotePath -replace '^C:\\', ''
+    $relative = $RemotePath -replace '^C:\\Windows\\', ''
+    $unc      = "\\$TargetComputer\Admin$\$relative"
     try {
-        if ($Script:AdminDriveName) {
-            return (Get-Content -LiteralPath "${Script:AdminDriveName}:\$relative" -Raw -ErrorAction Stop)
-        }
-        return (Get-Content -LiteralPath "\\$TargetComputer\Admin$\$relative" -Raw -ErrorAction Stop)
+        return (Get-Content -LiteralPath $unc -Raw -ErrorAction Stop)
     } catch {
         return $null
     }
@@ -384,17 +372,52 @@ function Read-RemoteTextViaAdmin {
 #>
 function Get-RemoteTrackerLogTail {
     param([int]$Lines = 50)
-    $candidates = @(
+
+    # Static candidate paths (no wildcards)
+    $staticCandidates = @(
         "\\$TargetComputer\C$\Windows\Temp\ManageSoft\tracker.log",
         "\\$TargetComputer\C$\ProgramData\Flexera Software\Compliance\Logging\tracker.log",
         "\\$TargetComputer\C$\Program Files (x86)\ManageSoft\tracker.log"
     )
-    foreach ($path in $candidates) {
+    foreach ($path in $staticCandidates) {
         try {
             $content = Get-Content -LiteralPath $path -Tail $Lines -ErrorAction Stop
             return [PSCustomObject]@{ Path = $path; Lines = $content }
         } catch { }
     }
+
+    # Wildcard search: C:\Users\<any user>\AppData\Local\Temp\<any numeric subdir>\ManageSoft\tracker.log
+    # ndtrack runs as the invoking user so the log lands under their profile temp folder,
+    # which Windows may place in a numbered subfolder (1, 2, 3...) under %TEMP%.
+    $usersRoot = "\\$TargetComputer\C$\Users"
+    try {
+        $found = Get-ChildItem -Path $usersRoot -Directory -ErrorAction Stop |
+            ForEach-Object {
+                $userTemp = Join-Path $_.FullName 'AppData\Local\Temp'
+                # Check direct ManageSoft folder and one level of numeric subfolders
+                $directLog = Join-Path $userTemp 'ManageSoft\tracker.log'
+                if (Test-Path -LiteralPath $directLog -ErrorAction SilentlyContinue) {
+                    return $directLog
+                }
+                # Numbered subdirs (e.g. Temp\1\, Temp\2\, Temp\3\)
+                if (Test-Path -LiteralPath $userTemp -ErrorAction SilentlyContinue) {
+                    Get-ChildItem -Path $userTemp -Directory -ErrorAction SilentlyContinue |
+                        Where-Object { $_.Name -match '^\d+$' } |
+                        ForEach-Object {
+                            $subLog = Join-Path $_.FullName 'ManageSoft\tracker.log'
+                            if (Test-Path -LiteralPath $subLog -ErrorAction SilentlyContinue) {
+                                return $subLog
+                            }
+                        }
+                }
+            } | Select-Object -First 1
+
+        if ($found) {
+            $content = Get-Content -LiteralPath $found -Tail $Lines -ErrorAction Stop
+            return [PSCustomObject]@{ Path = $found; Lines = $content }
+        }
+    } catch { }
+
     return $null
 }
 
@@ -404,14 +427,40 @@ function Get-RemoteTrackerLogTail {
 
 function Test-DNSLocal {
     Write-Host "`n── [1] LOCAL REACHABILITY ──────────────────────────────────────" -ForegroundColor DarkCyan
-    try {
-        $resolved = [System.Net.Dns]::GetHostAddresses($TargetComputer)
-        $ips      = ($resolved | ForEach-Object { $_.IPAddressToString }) -join ', '
-        Add-Result -Category 'DNS' -Test 'Resolve target name' -Result $PASS -Detail $ips
-    } catch {
-        Add-Result -Category 'DNS' -Test 'Resolve target name' -Result $FAIL `
-            -Detail $_.Exception.Message `
-            -Hint 'Fix DNS/hosts file before any other test can succeed.'
+
+    # Test resolution of TargetComputer — skip if it is already an IP address
+    $ipPattern = '^(\d{1,3}\.){3}\d{1,3}$'
+    if ($TargetComputer -match $ipPattern) {
+        Add-Result -Category 'DNS' -Test 'Resolve target name' -Result $INFO `
+            -Detail "$TargetComputer is an IP address — DNS resolution skipped"
+    } else {
+        try {
+            $resolved = [System.Net.Dns]::GetHostAddresses($TargetComputer)
+            $ips      = ($resolved | Where-Object { $_.AddressFamily -eq 'InterNetwork' } |
+                         ForEach-Object { $_.IPAddressToString }) -join ', '
+            Add-Result -Category 'DNS' -Test 'Resolve target name' -Result $PASS -Detail $ips
+        } catch {
+            Add-Result -Category 'DNS' -Test 'Resolve target name' -Result $FAIL `
+                -Detail $_.Exception.Message `
+                -Hint 'Fix DNS/hosts file before any other test can succeed.'
+        }
+    }
+
+    # Also test local resolution of BeaconHostname — required for UNC path construction
+    if ($BeaconHostname -match $ipPattern) {
+        Add-Result -Category 'DNS' -Test 'Resolve BeaconHostname (local)' -Result $INFO `
+            -Detail "$BeaconHostname is an IP address — DNS resolution skipped"
+    } else {
+        try {
+            $resolved = [System.Net.Dns]::GetHostAddresses($BeaconHostname)
+            $ips      = ($resolved | Where-Object { $_.AddressFamily -eq 'InterNetwork' } |
+                         ForEach-Object { $_.IPAddressToString }) -join ', '
+            Add-Result -Category 'DNS' -Test 'Resolve BeaconHostname (local)' -Result $PASS -Detail $ips
+        } catch {
+            Add-Result -Category 'DNS' -Test 'Resolve BeaconHostname (local)' -Result $FAIL `
+                -Detail $_.Exception.Message `
+                -Hint "Local machine cannot resolve '$BeaconHostname'. The UNC path to mgsRET$ will fail."
+        }
     }
 }
 
@@ -467,17 +516,18 @@ function Test-TCPPorts {
 
 function Test-AdminShareRW {
     Write-Host "`n── [2] SMB / ADMIN$ ACCESS ─────────────────────────────────────" -ForegroundColor DarkCyan
-    $tag      = [guid]::NewGuid().ToString('N').Substring(0,8)
+    $testFile = "\\$TargetComputer\Admin$\Temp\ZFPDiagTest_$([guid]::NewGuid().ToString('N').Substring(0,8)).tmp"
     try {
-        if (-not (Mount-AdminShare)) { throw "Failed to mount \\$TargetComputer\Admin$" }
-        $drivePath = "${Script:AdminDriveName}:\Temp\ZFPDiagTest_${tag}.tmp"
-        # Write test
-        Set-Content  -LiteralPath $drivePath -Value 'ZFP_DIAG_OK' -ErrorAction Stop
-        # Read back
-        $content = Get-Content -LiteralPath $drivePath -Raw -ErrorAction Stop
-        # Delete
-        Remove-Item  -LiteralPath $drivePath -Force -ErrorAction SilentlyContinue
-        if ($content -notmatch 'ZFP_DIAG_OK') { throw 'Read-back content mismatch' }
+        Use-AdminShareDrive {
+            # Write test
+            [IO.File]::WriteAllText($testFile, 'ZFP_DIAG_OK')
+            # Read back
+            $content = [IO.File]::ReadAllText($testFile)
+            # Delete
+            Remove-Item -LiteralPath $testFile -Force -ErrorAction SilentlyContinue
+            return $content
+        } | Out-Null
+
         Add-Result -Category 'SMB' -Test 'Admin$ read/write' -Result $PASS `
             -Detail "\\$TargetComputer\Admin$ writable"
     } catch {
@@ -489,17 +539,14 @@ function Test-AdminShareRW {
 
 function Test-CShareRead {
     # C$ read confirms broad admin share access (used for log tailing)
-    $path   = "\\$TargetComputer\C$\Windows\System32\cmd.exe"
-    $stream = $null
+    $path = "\\$TargetComputer\C$\Windows\System32\cmd.exe"
     try {
-        $stream = [IO.File]::OpenRead($path)
+        $null = [IO.File]::OpenRead($path)
         Add-Result -Category 'SMB' -Test 'C$ share readable' -Result $PASS -Detail $path
     } catch {
         Add-Result -Category 'SMB' -Test 'C$ share readable' -Result $WARN `
             -Detail $_.Exception.Message `
             -Hint 'C$ access is needed for log tailing. Not strictly required for ZFP itself.'
-    } finally {
-        if ($stream) { $stream.Dispose() }
     }
 }
 
@@ -514,14 +561,8 @@ function Test-RemoteExecution {
     try {
         $null = Get-TargetCimSession
         $proto = $Script:CimSession.Protocol
-        if ($proto -eq 'Dcom') {
-            Add-Result -Category 'WMI/CIM' -Test 'CIM session established' -Result $PASS `
-                -Detail "Connected via DCOM (matches Flexera Beacon transport)"
-        } else {
-            Add-Result -Category 'WMI/CIM' -Test 'CIM session established' -Result $WARN `
-                -Detail "Connected via $proto — DCOM failed, fell back to WSMan. Flexera Beacon uses DCOM; this result may not reflect real inventory behaviour." `
-                -Hint 'Check TCP 135 and dynamic RPC port range (49152-65535) to the target. DCOM Launch/Activation permissions in Component Services may also be blocking.'
-        }
+        Add-Result -Category 'WMI/CIM' -Test 'CIM session established' -Result $PASS `
+            -Detail "Connected via $proto"
     } catch {
         Add-Result -Category 'WMI/CIM' -Test 'CIM session established' -Result $FAIL `
             -Detail $_.Exception.Message `
@@ -529,16 +570,37 @@ function Test-RemoteExecution {
         return  # Nothing further will work
     }
 
-    # 3b. Smoke test: create diag directory on target
-    $mkdirCmd = "cmd /c mkdir `"$RemoteDiagDir`" 2>nul"
+    # 3b. Smoke test: create diag directory on target, then verify it exists via Admin$
+    # IMPORTANT: Invoke-RemoteCimProcess returns as soon as the process launches — it does
+    # NOT wait for the process to finish. We must poll for the directory's existence via
+    # Admin$ before any subsequent tests try to write output files into it.
+    $mkdirCmd = "C:\Windows\System32\cmd.exe /c mkdir `"$RemoteDiagDir`" 2>nul"
     $r        = Invoke-RemoteCimProcess -CommandLine $mkdirCmd -Description 'mkdir diag dir'
-    if ($r.ReturnCode -eq 0) {
-        Add-Result -Category 'WMI/CIM' -Test 'Remote process creation (smoke test)' -Result $PASS `
-            -Detail "Win32_Process.Create returned 0 (Success) — PID $($r.ProcessId)"
-    } else {
+    if ($r.ReturnCode -ne 0) {
         Add-Result -Category 'WMI/CIM' -Test 'Remote process creation (smoke test)' -Result $FAIL `
             -Detail "$($r.ReturnText) | $($r.Error)" `
             -Hint   'Check DCOM Launch/Access permissions in Component Services. Verify WMI service on target.'
+        return
+    }
+
+    # Poll via Admin$ until the directory appears (up to 15 seconds)
+    $diagDirAdminPath = $RemoteDiagDir -replace '^C:\\Windows\\', "\\$TargetComputer\Admin`$\"
+    $dirReady  = $false
+    $dirDeadline = [datetime]::UtcNow.AddSeconds(15)
+    do {
+        Start-Sleep -Seconds 2
+        if (Test-Path -LiteralPath $diagDirAdminPath -ErrorAction SilentlyContinue) {
+            $dirReady = $true
+        }
+    } while (-not $dirReady -and [datetime]::UtcNow -lt $dirDeadline)
+
+    if ($dirReady) {
+        Add-Result -Category 'WMI/CIM' -Test 'Remote process creation (smoke test)' -Result $PASS `
+            -Detail "Win32_Process.Create returned 0 — diag dir confirmed at $RemoteDiagDir"
+    } else {
+        Add-Result -Category 'WMI/CIM' -Test 'Remote process creation (smoke test)' -Result $WARN `
+            -Detail "Process launched but diag dir not visible via Admin$ after 15s — output capture may fail" `
+            -Hint   "Check Admin$ access. Dir may still exist on target but Admin$ credentials may lack read access."
     }
 
 }
@@ -557,7 +619,7 @@ function Test-RemoteExecution {
 function Test-TargetSideDNS {
     Write-Host "`n── [4] TARGET-SIDE CHECKS ──────────────────────────────────────" -ForegroundColor DarkCyan
     $proc = Invoke-RemoteCapturedProcess -Tag 'dns_beacon' `
-                -InnerCommand "nslookup $BeaconHostname" -TimeoutSec 30
+                -InnerCommand "C:\Windows\System32\nslookup.exe $BeaconHostname" -TimeoutSec 30
     if (-not $proc.Launched) {
         Add-Result -Category 'Target→DNS' -Test "Resolve BeaconHost ($BeaconHostname)" `
             -Result $FAIL -Detail "Launch failed: $($proc.LaunchError)" `
@@ -605,35 +667,79 @@ function Test-TargetUNCRead {
 }
 
 function Test-TargetHTTPUploadLocation {
-    # Can the target reach the ManageSoftRL endpoint?
-    $psCmd  = "powershell -NonInteractive -Command `"try { Invoke-WebRequest -Uri '$UploadLocation' -UseBasicParsing -TimeoutSec 15 -ErrorAction Stop | Select-Object -ExpandProperty StatusCode } catch { Write-Error `$_.Exception.Message; exit 1 }`""
-    $proc   = Invoke-RemoteCapturedProcess -Tag 'http_upload' -InnerCommand $psCmd -TimeoutSec 45
+    # Hits the /test endpoint which returns "Test succeeded" on a healthy beacon.
+    # Writes a .ps1 script to the target via Admin$, then runs it via
+    # Invoke-RemoteCapturedProcess so output capture and process wait are
+    # handled consistently with all other target-side tests.
+
+    $scriptPath      = "$RemoteDiagDir\http_test.ps1"
+    $scriptAdminPath = $scriptPath -replace '^C:\\Windows\\', "\\$TargetComputer\Admin`$\"
+
+    # Prefix output lines with STATUS:/ERROR: so we can parse them without
+    # relying on fragile line-number or regex matching of raw HTTP status codes.
+    $psScript = @'
+try {
+    $r = Invoke-WebRequest -Uri 'UPLOADTESTURL_PLACEHOLDER' -UseBasicParsing -TimeoutSec 15 -ErrorAction Stop
+    Write-Output ("STATUS:" + $r.StatusCode)
+    Write-Output $r.Content
+    exit 0
+} catch {
+    Write-Output ("ERROR:" + $_.Exception.Message)
+    exit 1
+}
+'@
+    $psScript = $psScript -replace 'UPLOADTESTURL_PLACEHOLDER', $UploadTestURL
+
+    try {
+        [IO.File]::WriteAllText($scriptAdminPath, $psScript)
+    } catch {
+        Add-Result -Category 'Target→HTTP' -Test 'Reach UploadLocation (/test)' `
+            -Result $FAIL -Detail "Could not stage test script via Admin`$: $($_.Exception.Message)" `
+            -Hint 'Confirm Admin$ write access is working (Section 2 should show PASS).'
+        return
+    }
+
+    $psExe = "%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe"
+    $proc  = Invoke-RemoteCapturedProcess -Tag 'http_upload' `
+                 -InnerCommand "$psExe -NonInteractive -ExecutionPolicy Bypass -File `"$scriptPath`"" `
+                 -TimeoutSec 45
 
     if (-not $proc.Launched) {
-        Add-Result -Category 'Target→HTTP' -Test "Reach UploadLocation" `
+        Add-Result -Category 'Target→HTTP' -Test 'Reach UploadLocation (/test)' `
             -Result $FAIL -Detail "Launch failed: $($proc.LaunchError)" `
             -Hint 'Remote process creation failed before HTTP test could run.'
         return
     }
+
     $out  = Read-RemoteTextViaAdmin -RemotePath $proc.StdoutFile
     $err  = Read-RemoteTextViaAdmin -RemotePath $proc.StderrFile
-    $exit = $null; $rawExit = Read-RemoteTextViaAdmin -RemotePath $proc.ExitFile; if ($rawExit) { $exit = $rawExit.Trim() }
+    $exit = $null
+    $rawExit = Read-RemoteTextViaAdmin -RemotePath $proc.ExitFile
+    if ($rawExit) { $exit = $rawExit.Trim() }
 
-    $statusCode = ($out -split '\r?\n' | Where-Object { $_ -match '^\d{3}$' } | Select-Object -First 1)
+    $testSucceeded = $out -match 'Test succeeded'
+    $statusLine    = ($out -split "`r?`n" | Where-Object { $_ -match '^STATUS:' } | Select-Object -First 1)
+    $statusCode    = if ($statusLine) { ($statusLine -replace '^STATUS:', '').Trim() } else { '' }
+    $errorLine     = ($out -split "`r?`n" | Where-Object { $_ -match '^ERROR:'  } | Select-Object -First 1)
 
-    if ($exit -eq '0' -and $statusCode) {
-        $resultCode = if ($statusCode -in @('200','301','302','401','403')) { $PASS } else { $WARN }
-        $httpHint   = if ($resultCode -eq $WARN) { "Unexpected status $statusCode — verify URL is correct." } else { '' }
-        Add-Result -Category 'Target→HTTP' -Test "Reach UploadLocation" `
-            -Result $resultCode `
-            -Detail "HTTP $statusCode from $UploadLocation" `
-            -Hint   $httpHint
+    if ($exit -eq '0' -and $testSucceeded) {
+        Add-Result -Category 'Target→HTTP' -Test 'Reach UploadLocation (/test)' `
+            -Result $PASS `
+            -Detail "HTTP $statusCode — 'Test succeeded' confirmed at $UploadTestURL"
+    } elseif ($exit -eq '0') {
+        $outSnip = if ($out) { $out.Trim().Substring(0, [Math]::Min(120, $out.Trim().Length)) } else { '' }
+        Add-Result -Category 'Target→HTTP' -Test 'Reach UploadLocation (/test)' `
+            -Result $WARN `
+            -Detail "HTTP $statusCode — reachable but 'Test succeeded' not in response: $outSnip" `
+            -Hint 'Beacon responded but content unexpected. Verify ManageSoftRL is healthy.'
     } else {
-        $errTrimmed = if ($err) { $err.Trim() } else { '' }
-        Add-Result -Category 'Target→HTTP' -Test "Reach UploadLocation" `
+        $errDetail = if ($errorLine) { ($errorLine -replace '^ERROR:', '').Trim() } `
+                     elseif ($err)   { $err.Trim() } `
+                     else            { '(no output captured)' }
+        Add-Result -Category 'Target→HTTP' -Test 'Reach UploadLocation (/test)' `
             -Result $FAIL `
-            -Detail "Exit $exit | stderr: $errTrimmed" `
-            -Hint "Target cannot reach UploadLocation. Check firewall rules from target subnet to Beacon HTTP port."
+            -Detail "Exit $exit | $errDetail" `
+            -Hint "Target cannot reach $UploadTestURL. Check firewall rules and that the Beacon HTTP service is running."
     }
 }
 
@@ -656,11 +762,16 @@ function Invoke-NdtrackUNC {
         return
     }
 
-    # Minimal args — enough to get a log entry without a full inventory run
-    $ndArgs  = "MachineID=ZFPDiag_Test UploadLocation=`"$UploadLocation`" LogFile=`"$RemoteDiagDir\ndtrack.log`""
-    $ndCmd   = "`"$NdtrackUNC`" $ndArgs"
+    # Launch ndtrack with the correct -t Machine -o argument syntax.
+    # Timeout is 180 seconds — ndtrack can take 1-2 minutes to complete a scan.
+    # NdtrackUNC is intentionally NOT quoted — UNC paths have no spaces so quotes are
+    # unnecessary, and cmd /c mangles the command when it starts with a quoted token
+    # AND contains additional quoted pairs (like UploadLocation="...").
+    $ndCmd = "$NdtrackUNC -t Machine -o UploadLocation=`"$UploadLocation`" $NdtrackExtraArgs"
 
-    $proc = Invoke-RemoteCapturedProcess -Tag 'ndtrack_unc' -InnerCommand $ndCmd -TimeoutSec 180
+    # Timeout set to 300s (5 min). Cloud provider metadata probes at 169.254.169.254
+    # each timeout at ~21s; 4+ providers = 84s of unavoidable waits before upload starts.
+    $proc = Invoke-RemoteCapturedProcess -Tag 'ndtrack_unc' -InnerCommand $ndCmd -TimeoutSec 300
 
     if (-not $proc.Launched) {
         Add-Result -Category 'ndtrack' -Test 'UNC launch (Beacon-style)' `
@@ -673,7 +784,7 @@ function Invoke-NdtrackUNC {
     $stderr = Read-RemoteTextViaAdmin -RemotePath $proc.StderrFile
     $exit   = $null; $rawExit1 = Read-RemoteTextViaAdmin -RemotePath $proc.ExitFile; if ($rawExit1) { $exit = $rawExit1.Trim() }
 
-    $stdoutTrimmed = if ($stdout) { $stdout.Trim().Substring(0, [Math]::Min(200, $stdout.Length)) } else { '' }
+    $stdoutTrimmed = if ($stdout) { $t = $stdout.Trim(); $t.Substring(0, [Math]::Min(200, $t.Length)) } else { '' }
     $detail = "Exit $exit | stdout: $stdoutTrimmed"
 
     if ($exit -eq '0') {
@@ -696,6 +807,17 @@ function Invoke-NdtrackUNC {
         Write-Host "`n  ndtrack stderr:" -ForegroundColor Yellow
         Write-Host $stderr -ForegroundColor Yellow
     }
+
+    # Show the last 20 lines of tracker.log immediately after ndtrack finishes
+    # so the result is visible without waiting for Section 6.
+    Write-Host "`n  tracker.log (last 20 lines):" -ForegroundColor DarkGray
+    $inlineTail = Get-RemoteTrackerLogTail -Lines 20
+    if ($inlineTail) {
+        Write-Host "  Source: $($inlineTail.Path)" -ForegroundColor DarkGray
+        $inlineTail.Lines | ForEach-Object { Write-Host "  $_" -ForegroundColor DarkGray }
+    } else {
+        Write-Host "  (tracker.log not found — ndtrack may not have written one yet)" -ForegroundColor DarkGray
+    }
 }
 
 function Invoke-NdtrackLocalStaged {
@@ -706,14 +828,12 @@ function Invoke-NdtrackLocalStaged {
 
     # Stage: copy ndtrack.exe from Beacon share to target via Admin$
     $localExe = "$RemoteDiagDir\ndtrack_staged.exe"
-    if ($Script:AdminDriveName) {
-        $adminDest = $localExe -replace '^C:\\', "${Script:AdminDriveName}:\"
-    } else {
-        $adminDest = $localExe -replace '^C:\\', "\\$TargetComputer\Admin$\"
-    }
+    $adminDest = $localExe -replace '^C:\\Windows\\', "\\$TargetComputer\Admin$\"
 
     try {
-        Copy-Item -LiteralPath $NdtrackUNC -Destination $adminDest -Force -ErrorAction Stop
+        Use-AdminShareDrive {
+            Copy-Item -LiteralPath $NdtrackUNC -Destination $adminDest -Force -ErrorAction Stop
+        }
         Add-Result -Category 'ndtrack' -Test 'Stage ndtrack.exe locally' -Result $PASS `
             -Detail "Copied to $localExe on target"
     } catch {
@@ -724,16 +844,9 @@ function Invoke-NdtrackLocalStaged {
     }
 
     # Run from local path
-    $ndArgs = "MachineID=ZFPDiag_Staged UploadLocation=`"$UploadLocation`" LogFile=`"$RemoteDiagDir\ndtrack_staged.log`""
+    $ndArgs = "-t Machine -o UploadLocation=`"$UploadLocation`" $NdtrackExtraArgs"
     $proc   = Invoke-RemoteCapturedProcess -Tag 'ndtrack_local' `
-                  -InnerCommand "`"$localExe`" $ndArgs" -TimeoutSec 180
-
-    if (-not $proc.Launched) {
-        Add-Result -Category 'ndtrack' -Test 'Staged local run' -Result $FAIL `
-            -Detail "Launch failed: $($proc.LaunchError)" `
-            -Hint 'Win32_Process.Create could not launch the staged executable.'
-        return
-    }
+                  -InnerCommand "`"$localExe`" $ndArgs" -TimeoutSec 300
 
     $stdout = Read-RemoteTextViaAdmin -RemotePath $proc.StdoutFile
     $stderr = Read-RemoteTextViaAdmin -RemotePath $proc.StderrFile
@@ -761,8 +874,8 @@ function Invoke-NdtrackLocalStaged {
 #region ── SECTION 6: TRACKER.LOG TAIL ──────────────────────────────────────────
 
 function Show-TrackerLogTail {
-    Write-Host "`n── [6] TRACKER.LOG (last 30 lines) ─────────────────────────────" -ForegroundColor DarkCyan
-    $tail = Get-RemoteTrackerLogTail -Lines 30
+    Write-Host "`n── [6] TRACKER.LOG (last 20 lines) ─────────────────────────────" -ForegroundColor DarkCyan
+    $tail = Get-RemoteTrackerLogTail -Lines 20
     if ($tail) {
         Write-Host "  Source: $($tail.Path)" -ForegroundColor DarkGray
         $tail.Lines | ForEach-Object { Write-Host "  $_" -ForegroundColor DarkGray }
@@ -872,23 +985,9 @@ $($rows -join "`n")
 #region ── CLEANUP ───────────────────────────────────────────────────────────────
 
 function Invoke-Cleanup {
-    # Remove remote diag directory from target if requested (Enhancement 6)
-    if ($CleanupRemoteDiagDir -and $Script:CimSession) {
-        try {
-            $cleanCmd = "cmd /c rmdir /s /q `"$RemoteDiagDir`""
-            Invoke-RemoteCimProcess -CommandLine $cleanCmd | Out-Null
-            Add-Result -Category 'Cleanup' -Test 'Remove remote diag dir' -Result $INFO `
-                -Detail $RemoteDiagDir
-        } catch { }
-    }
     if ($Script:CimSession) {
         try { Remove-CimSession -CimSession $Script:CimSession -ErrorAction SilentlyContinue } catch {}
         $Script:CimSession = $null
-    }
-    # Unmount the persistent Admin$ PSDrive
-    if ($Script:AdminDriveName -and (Get-PSDrive -Name $Script:AdminDriveName -ErrorAction SilentlyContinue)) {
-        Remove-PSDrive -Name $Script:AdminDriveName -Force -ErrorAction SilentlyContinue
-        $Script:AdminDriveName = $null
     }
 }
 
@@ -897,19 +996,6 @@ function Invoke-Cleanup {
 #region ── MAIN ORCHESTRATOR ─────────────────────────────────────────────────────
 
 function Test-FlexeraZFARequirements {
-    # ── Elevation check (Enhancement 5)
-    $isElevated = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
-                   [Security.Principal.WindowsBuiltInRole]::Administrator)
-    if (-not $isElevated) {
-        Write-Warning 'This script must be run from an elevated (Run as Administrator) PowerShell session. Exiting.'
-        return
-    }
-
-    # ── Transcript (Enhancement 7)
-    if ($TranscriptPath) {
-        Start-Transcript -Path $TranscriptPath -Force -ErrorAction SilentlyContinue
-    }
-
     Write-Host @"
 
 ══════════════════════════════════════════════════════════════════
@@ -935,15 +1021,13 @@ function Test-FlexeraZFARequirements {
         # ── Section 3: Remote execution
         Test-RemoteExecution
 
-        # ── Evaluate prerequisites for downstream sections independently (Enhancement 8)
+        # ── Section 4: Target-side checks (requires sections 2+3)
         $smokeResult   = $Script:Results | Where-Object { $_.Test -eq 'Remote process creation (smoke test)' } | Select-Object -Last 1
         $adminResult   = $Script:Results | Where-Object { $_.Test -eq 'Admin$ read/write' } | Select-Object -Last 1
-        $canRemoteExec = ($null -ne $smokeResult) -and ($smokeResult.Result -eq $PASS)
-        $hasAdminShare = ($null -ne $adminResult) -and ($adminResult.Result -eq $PASS)
+        $canRemoteExec = ($smokeResult -ne $null) -and ($smokeResult.Result -eq $PASS)
+        $hasAdminShare = ($adminResult -ne $null) -and ($adminResult.Result -eq $PASS)
 
-        # ── Section 4+5: Target-side checks and ndtrack (require remote exec only;
-        #    Admin$ failures surface in individual test details rather than blocking all tests)
-        if ($canRemoteExec) {
+        if ($canRemoteExec -and $hasAdminShare) {
             Test-TargetSideDNS
             Test-TargetUNCRead
             Test-TargetHTTPUploadLocation
@@ -951,20 +1035,15 @@ function Test-FlexeraZFARequirements {
             # ── Section 5: ndtrack execution
             Invoke-NdtrackUNC
             Invoke-NdtrackLocalStaged
-        } else {
-            @('Target-side DNS', 'Target→UNC read', 'Target→HTTP', 'ndtrack UNC', 'ndtrack staged') |
-            ForEach-Object {
-                Add-Result -Category 'Skipped' -Test $_ -Result $SKIP `
-                    -Detail 'Skipped — remote process creation failed'
-            }
-        }
 
-        # ── Section 6: Log tail (requires Admin$/C$ only — independent of remote exec)
-        if ($hasAdminShare) {
+            # ── Section 6: Log tail
             Show-TrackerLogTail
         } else {
-            Add-Result -Category 'Skipped' -Test 'tracker.log' -Result $SKIP `
-                -Detail 'Skipped — Admin$ not accessible'
+            @('Target-side DNS', 'Target→UNC read', 'Target→HTTP', 'ndtrack UNC', 'ndtrack staged', 'tracker.log') |
+            ForEach-Object {
+                Add-Result -Category 'Skipped' -Test $_ -Result $SKIP `
+                    -Detail 'Skipped — prerequisite (remote exec or Admin$) failed'
+            }
         }
     } catch {
         Write-Warning "Unexpected error during diagnostic run: $($_.Exception.Message)"
@@ -972,7 +1051,6 @@ function Test-FlexeraZFARequirements {
             -Detail $_.Exception.Message
     } finally {
         Invoke-Cleanup
-        if ($TranscriptPath) { try { Stop-Transcript } catch {} }
     }
 
     # ── Summary
