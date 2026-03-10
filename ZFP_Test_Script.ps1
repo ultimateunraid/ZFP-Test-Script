@@ -26,7 +26,7 @@
 
 .NOTES
     Author  : Gabe (IT Infrastructure)
-    Version : 2.1
+    Version : 2.2
     Requires: PowerShell 5.1+, run elevated on the machine performing the scan.
     Target  : Windows hosts (Flexera FNMS 2023 R2 ZFA requirements)
 
@@ -42,6 +42,20 @@
     [+] HTML report for sharing with firewall/network teams.
     [+] Timeout guard on WMI remote process waits (prevents indefinite hangs).
     [+] PS 5.1 compatible — no null-coalescing (??), ternary (? :), or null-conditional (?.)
+
+    ── v2.2 CHANGES ────────────────────────────────────────────────────────────────
+    [fix] Removed dead $DiagDirRemoteAdmin variable (never referenced).
+    [fix] Admin$ now mounted as a persistent PSDrive (Mount-AdminShare) for the full
+          run so Read-RemoteTextViaAdmin and staged copies use the same authenticated
+          session rather than mixing credential and no-credential UNC access.
+    [fix] Test-CShareRead now closes the FileStream in a finally block (was leaking handle).
+    [fix] Invoke-NdtrackLocalStaged now checks $proc.Launched before reading output files.
+    [fix] Null-check order in prerequisite guards uses ($null -ne $x) to be strict-mode safe.
+    [new] Elevation check at startup — exits immediately with a clear message if not admin.
+    [new] Optional PowerShell transcript ($TranscriptPath) for full session capture.
+    [new] Optional remote temp dir cleanup after the run ($CleanupRemoteDiagDir, default $true).
+    [new] Section 4/5 (target-side checks) now gated on remote exec only; tracker.log
+          (Section 6) gated on Admin$ only — the two prerequisites are evaluated independently.
     ────────────────────────────────────────────────────────────────────────────────
 #>
 
@@ -76,6 +90,14 @@ $SkipNdtrackExecution = $false
 # Example: 'C:\Diag\ZFP_WORKSTATION01.html'
 $HtmlReportPath      = ''
 
+# Set to $true to remove the remote temp folder from the target after the run.
+# Set to $false to keep files in place for manual debugging.
+$CleanupRemoteDiagDir = $true
+
+# Optional: full path to write a PowerShell transcript of this run. Leave empty '' to skip.
+# Example: 'C:\Diag\ZFP_WORKSTATION01_transcript.txt'
+$TranscriptPath       = ''
+
 # Temp directory created on the target for capturing command output files.
 $RemoteDiagDir       = 'C:\Windows\Temp\FlexeraZFPDiag'
 
@@ -92,9 +114,6 @@ $UploadLocation = "http://$UploadServer/ManageSoftRL"
 # Build the full ndtrack UNC path.
 $NdtrackUNC     = "\\$BeaconHostname\mgsRET`$\$NdtrackRelativePath"
 
-# Admin$ path used for reading captured output files off the target.
-$DiagDirRemoteAdmin = $RemoteDiagDir -replace '^C:\\', "\\$TargetComputer\Admin`$\"
-
 # Prompt for password if a username was supplied; otherwise run as current user.
 if ($CredentialUsername -ne '') {
     $Credential = Get-Credential -UserName $CredentialUsername `
@@ -103,9 +122,9 @@ if ($CredentialUsername -ne '') {
     $Credential = $null
 }
 
-$Script:Results      = [System.Collections.Generic.List[PSObject]]::new()
-$Script:AdminDrive   = $null   # PSDrive letter if Admin$ is mapped
-$Script:CimSession   = $null   # Reusable CIM session
+$Script:Results        = [System.Collections.Generic.List[PSObject]]::new()
+$Script:AdminDriveName = $null   # PSDrive name if Admin$ is persistently mounted
+$Script:CimSession     = $null   # Reusable CIM session
 
 $PASS  = 'PASS'
 $WARN  = 'WARN'
@@ -312,43 +331,45 @@ function Invoke-RemoteCapturedProcess {
 
 <#
 .DESCRIPTION
-    Maps \\Target\Admin$ to a temporary PSDrive and runs a scriptblock within that
-    context, then removes the drive. Returns whatever the scriptblock returns.
-    Caches the drive letter in $Script:AdminDrive for reuse within one session.
+    Maps \\Target\Admin$ to a persistent PSDrive (ZFPDiag:) for the lifetime of
+    the script run, using $Credential when provided. Subsequent UNC reads and
+    copies all route through this authenticated drive so credentials are applied
+    consistently. The drive is removed in Invoke-Cleanup.
+    Returns $true on success, $false on failure.
 #>
-function Use-AdminShareDrive {
-    param([scriptblock]$Action)
-    $driveLetter = 'ZFPDiag'
-    $unc         = "\\$TargetComputer\Admin$"
-
-    $mapArgs = @{ Name = $driveLetter; PSProvider = 'FileSystem'; Root = $unc; ErrorAction = 'Stop' }
+function Mount-AdminShare {
+    $driveName = 'ZFPDiag'
+    if (Get-PSDrive -Name $driveName -ErrorAction SilentlyContinue) {
+        $Script:AdminDriveName = $driveName
+        return $true
+    }
+    $mapArgs = @{ Name = $driveName; PSProvider = 'FileSystem'; Root = "\\$TargetComputer\Admin$"; ErrorAction = 'Stop' }
     if ($Credential) { $mapArgs['Credential'] = $Credential }
-
     try {
-        if (-not (Get-PSDrive -Name $driveLetter -ErrorAction SilentlyContinue)) {
-            New-PSDrive @mapArgs | Out-Null
-        }
-        $Script:AdminDrive = "${driveLetter}:"
-        return (& $Action)
-    } finally {
-        if (Get-PSDrive -Name $driveLetter -ErrorAction SilentlyContinue) {
-            Remove-PSDrive -Name $driveLetter -Force -ErrorAction SilentlyContinue
-            $Script:AdminDrive = $null
-        }
+        New-PSDrive @mapArgs | Out-Null
+        $Script:AdminDriveName = $driveName
+        return $true
+    } catch {
+        $Script:AdminDriveName = $null
+        return $false
     }
 }
 
 <#
 .DESCRIPTION
-    Reads a remote file back via Admin$ (C:\Windows\... → \\Target\Admin$\...).
+    Reads a remote file back via Admin$ (C:\Windows\... → Admin$\...).
+    Uses the persistent PSDrive (ZFPDiag:) when mounted so that credential-based
+    authentication is applied consistently; falls back to raw UNC otherwise.
     Returns the content as a string, or $null on failure.
 #>
 function Read-RemoteTextViaAdmin {
     param([string]$RemotePath)   # e.g. C:\Windows\Temp\FlexeraZFPDiag\foo.txt
     $relative = $RemotePath -replace '^C:\\', ''
-    $unc      = "\\$TargetComputer\Admin$\$relative"
     try {
-        return (Get-Content -LiteralPath $unc -Raw -ErrorAction Stop)
+        if ($Script:AdminDriveName) {
+            return (Get-Content -LiteralPath "${Script:AdminDriveName}:\$relative" -Raw -ErrorAction Stop)
+        }
+        return (Get-Content -LiteralPath "\\$TargetComputer\Admin$\$relative" -Raw -ErrorAction Stop)
     } catch {
         return $null
     }
@@ -444,18 +465,17 @@ function Test-TCPPorts {
 
 function Test-AdminShareRW {
     Write-Host "`n── [2] SMB / ADMIN$ ACCESS ─────────────────────────────────────" -ForegroundColor DarkCyan
-    $testFile = "\\$TargetComputer\Admin$\Temp\ZFPDiagTest_$([guid]::NewGuid().ToString('N').Substring(0,8)).tmp"
+    $tag      = [guid]::NewGuid().ToString('N').Substring(0,8)
     try {
-        Use-AdminShareDrive {
-            # Write test
-            [IO.File]::WriteAllText($testFile, 'ZFP_DIAG_OK')
-            # Read back
-            $content = [IO.File]::ReadAllText($testFile)
-            # Delete
-            Remove-Item -LiteralPath $testFile -Force -ErrorAction SilentlyContinue
-            return $content
-        } | Out-Null
-
+        if (-not (Mount-AdminShare)) { throw "Failed to mount \\$TargetComputer\Admin$" }
+        $drivePath = "${Script:AdminDriveName}:\Temp\ZFPDiagTest_${tag}.tmp"
+        # Write test
+        Set-Content  -LiteralPath $drivePath -Value 'ZFP_DIAG_OK' -ErrorAction Stop
+        # Read back
+        $content = Get-Content -LiteralPath $drivePath -Raw -ErrorAction Stop
+        # Delete
+        Remove-Item  -LiteralPath $drivePath -Force -ErrorAction SilentlyContinue
+        if ($content -notmatch 'ZFP_DIAG_OK') { throw 'Read-back content mismatch' }
         Add-Result -Category 'SMB' -Test 'Admin$ read/write' -Result $PASS `
             -Detail "\\$TargetComputer\Admin$ writable"
     } catch {
@@ -467,14 +487,17 @@ function Test-AdminShareRW {
 
 function Test-CShareRead {
     # C$ read confirms broad admin share access (used for log tailing)
-    $path = "\\$TargetComputer\C$\Windows\System32\cmd.exe"
+    $path   = "\\$TargetComputer\C$\Windows\System32\cmd.exe"
+    $stream = $null
     try {
-        $null = [IO.File]::OpenRead($path)
+        $stream = [IO.File]::OpenRead($path)
         Add-Result -Category 'SMB' -Test 'C$ share readable' -Result $PASS -Detail $path
     } catch {
         Add-Result -Category 'SMB' -Test 'C$ share readable' -Result $WARN `
             -Detail $_.Exception.Message `
             -Hint 'C$ access is needed for log tailing. Not strictly required for ZFP itself.'
+    } finally {
+        if ($stream) { $stream.Dispose() }
     }
 }
 
@@ -675,12 +698,14 @@ function Invoke-NdtrackLocalStaged {
 
     # Stage: copy ndtrack.exe from Beacon share to target via Admin$
     $localExe = "$RemoteDiagDir\ndtrack_staged.exe"
-    $adminDest = $localExe -replace '^C:\\', "\\$TargetComputer\Admin$\"
+    if ($Script:AdminDriveName) {
+        $adminDest = $localExe -replace '^C:\\', "${Script:AdminDriveName}:\"
+    } else {
+        $adminDest = $localExe -replace '^C:\\', "\\$TargetComputer\Admin$\"
+    }
 
     try {
-        Use-AdminShareDrive {
-            Copy-Item -LiteralPath $NdtrackUNC -Destination $adminDest -Force -ErrorAction Stop
-        }
+        Copy-Item -LiteralPath $NdtrackUNC -Destination $adminDest -Force -ErrorAction Stop
         Add-Result -Category 'ndtrack' -Test 'Stage ndtrack.exe locally' -Result $PASS `
             -Detail "Copied to $localExe on target"
     } catch {
@@ -694,6 +719,13 @@ function Invoke-NdtrackLocalStaged {
     $ndArgs = "MachineID=ZFPDiag_Staged UploadLocation=`"$UploadLocation`" LogFile=`"$RemoteDiagDir\ndtrack_staged.log`""
     $proc   = Invoke-RemoteCapturedProcess -Tag 'ndtrack_local' `
                   -InnerCommand "`"$localExe`" $ndArgs" -TimeoutSec 180
+
+    if (-not $proc.Launched) {
+        Add-Result -Category 'ndtrack' -Test 'Staged local run' -Result $FAIL `
+            -Detail "Launch failed: $($proc.LaunchError)" `
+            -Hint 'Win32_Process.Create could not launch the staged executable.'
+        return
+    }
 
     $stdout = Read-RemoteTextViaAdmin -RemotePath $proc.StdoutFile
     $stderr = Read-RemoteTextViaAdmin -RemotePath $proc.StderrFile
@@ -832,9 +864,23 @@ $($rows -join "`n")
 #region ── CLEANUP ───────────────────────────────────────────────────────────────
 
 function Invoke-Cleanup {
+    # Remove remote diag directory from target if requested (Enhancement 6)
+    if ($CleanupRemoteDiagDir -and $Script:CimSession) {
+        try {
+            $cleanCmd = "cmd /c rmdir /s /q `"$RemoteDiagDir`""
+            Invoke-RemoteCimProcess -CommandLine $cleanCmd | Out-Null
+            Add-Result -Category 'Cleanup' -Test 'Remove remote diag dir' -Result $INFO `
+                -Detail $RemoteDiagDir
+        } catch { }
+    }
     if ($Script:CimSession) {
         try { Remove-CimSession -CimSession $Script:CimSession -ErrorAction SilentlyContinue } catch {}
         $Script:CimSession = $null
+    }
+    # Unmount the persistent Admin$ PSDrive
+    if ($Script:AdminDriveName -and (Get-PSDrive -Name $Script:AdminDriveName -ErrorAction SilentlyContinue)) {
+        Remove-PSDrive -Name $Script:AdminDriveName -Force -ErrorAction SilentlyContinue
+        $Script:AdminDriveName = $null
     }
 }
 
@@ -843,6 +889,19 @@ function Invoke-Cleanup {
 #region ── MAIN ORCHESTRATOR ─────────────────────────────────────────────────────
 
 function Test-FlexeraZFARequirements {
+    # ── Elevation check (Enhancement 5)
+    $isElevated = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
+                   [Security.Principal.WindowsBuiltInRole]::Administrator)
+    if (-not $isElevated) {
+        Write-Warning 'This script must be run from an elevated (Run as Administrator) PowerShell session. Exiting.'
+        return
+    }
+
+    # ── Transcript (Enhancement 7)
+    if ($TranscriptPath) {
+        Start-Transcript -Path $TranscriptPath -Force -ErrorAction SilentlyContinue
+    }
+
     Write-Host @"
 
 ══════════════════════════════════════════════════════════════════
@@ -868,13 +927,15 @@ function Test-FlexeraZFARequirements {
         # ── Section 3: Remote execution
         Test-RemoteExecution
 
-        # ── Section 4: Target-side checks (requires sections 2+3)
+        # ── Evaluate prerequisites for downstream sections independently (Enhancement 8)
         $smokeResult   = $Script:Results | Where-Object { $_.Test -eq 'Remote process creation (smoke test)' } | Select-Object -Last 1
         $adminResult   = $Script:Results | Where-Object { $_.Test -eq 'Admin$ read/write' } | Select-Object -Last 1
-        $canRemoteExec = ($smokeResult -ne $null) -and ($smokeResult.Result -eq $PASS)
-        $hasAdminShare = ($adminResult -ne $null) -and ($adminResult.Result -eq $PASS)
+        $canRemoteExec = ($null -ne $smokeResult) -and ($smokeResult.Result -eq $PASS)
+        $hasAdminShare = ($null -ne $adminResult) -and ($adminResult.Result -eq $PASS)
 
-        if ($canRemoteExec -and $hasAdminShare) {
+        # ── Section 4+5: Target-side checks and ndtrack (require remote exec only;
+        #    Admin$ failures surface in individual test details rather than blocking all tests)
+        if ($canRemoteExec) {
             Test-TargetSideDNS
             Test-TargetUNCRead
             Test-TargetHTTPUploadLocation
@@ -882,15 +943,20 @@ function Test-FlexeraZFARequirements {
             # ── Section 5: ndtrack execution
             Invoke-NdtrackUNC
             Invoke-NdtrackLocalStaged
-
-            # ── Section 6: Log tail
-            Show-TrackerLogTail
         } else {
-            @('Target-side DNS', 'Target→UNC read', 'Target→HTTP', 'ndtrack UNC', 'ndtrack staged', 'tracker.log') |
+            @('Target-side DNS', 'Target→UNC read', 'Target→HTTP', 'ndtrack UNC', 'ndtrack staged') |
             ForEach-Object {
                 Add-Result -Category 'Skipped' -Test $_ -Result $SKIP `
-                    -Detail 'Skipped — prerequisite (remote exec or Admin$) failed'
+                    -Detail 'Skipped — remote process creation failed'
             }
+        }
+
+        # ── Section 6: Log tail (requires Admin$/C$ only — independent of remote exec)
+        if ($hasAdminShare) {
+            Show-TrackerLogTail
+        } else {
+            Add-Result -Category 'Skipped' -Test 'tracker.log' -Result $SKIP `
+                -Detail 'Skipped — Admin$ not accessible'
         }
     } catch {
         Write-Warning "Unexpected error during diagnostic run: $($_.Exception.Message)"
@@ -898,6 +964,7 @@ function Test-FlexeraZFARequirements {
             -Detail $_.Exception.Message
     } finally {
         Invoke-Cleanup
+        if ($TranscriptPath) { try { Stop-Transcript } catch {} }
     }
 
     # ── Summary
