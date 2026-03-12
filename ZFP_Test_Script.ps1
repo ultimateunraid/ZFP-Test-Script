@@ -1,5 +1,23 @@
 ﻿#Requires -Version 5.1
 <#
+    INTERNAL USE — do not edit these params. They are populated automatically when
+    the script re-invokes itself as a parallel job for CSV multi-target runs.
+    To run interactively, edit the USER CONFIGURATION block below and run normally.
+#>
+param(
+    [string]$_CsvTargetComputer  = '',
+    [string]$_CsvBeaconHostname  = '',
+    [string]$_CsvUploadServer    = '',
+    [string]$_CsvUploadProtocol  = '',
+    [string]$_CsvUploadPort      = '',
+    [string]$_CsvHtmlReportPath  = '',
+    [string]$_CsvCredUser        = '',
+    [string]$_CsvCredPass        = ''   # DPAPI-encrypted SecureString (ConvertFrom-SecureString)
+)
+# True when the script is running as a background job spawned by the CSV orchestrator.
+$_IsBatchJob = ($PSBoundParameters.ContainsKey('_CsvTargetComputer') -and $_CsvTargetComputer -ne '')
+
+<#
 .SYNOPSIS
     Diagnostic script for Flexera Zero Footprint Agent (ZFA) / Zero Footprint Inventory (ZFP)
     Windows prerequisite validation.
@@ -25,7 +43,7 @@
 
 .NOTES
     Author  : Gabe (IT Infrastructure)
-    Version : 1.0
+    Version : 1.2
     Requires: PowerShell 5.1+, run elevated on the machine performing the scan.
     Target  : Windows hosts (Flexera FNMS 2023 R2 ZFA requirements)
 
@@ -73,12 +91,69 @@ $StageNdtrackLocally = $false
 # Set to $true to skip launching ndtrack.exe entirely (safe/read-only mode).
 $SkipNdtrackExecution = $false
 
-# Optional: full path to write an HTML report. Leave empty '' to skip.
-# Example: 'C:\Diag\ZFP_WORKSTATION01.html'
-$HtmlReportPath      = ''
+# ── REPORT OUTPUT ─────────────────────────────────────────────────────────────────
+#
+# Directory where diagnostic reports are automatically saved after each run.
+# Report files are named: YYYY-MM-DD_<ComputerName>.html  (or .csv — see $ReportFormat)
+# The directory will be created if it does not exist; the script will ask permission first.
+# Set to '' to disable automatic report generation.
+$ReportOutputDir = 'C:\Diag\ZFP Reports\'
+
+# Report file format: 'HTML' (default) or 'CSV'.
+# If HTML generation fails, the script automatically falls back to CSV.
+$ReportFormat = 'HTML'
+
+# Override: set a specific full path for the report file (single-target mode only).
+# When set, $ReportOutputDir and auto-naming are ignored for this run.
+# Leave empty '' to use the auto-named file in $ReportOutputDir.
+$HtmlReportPath = ''
 
 # Temp directory created on the target for capturing command output files.
 $RemoteDiagDir       = 'C:\Windows\Temp\FlexeraZFPDiag'
+
+# ── MULTI-TARGET / CSV MODE ───────────────────────────────────────────────────────
+#
+# Set $RunMode to 'Single' to test one machine (uses $TargetComputer above).
+# Set $RunMode to 'Csv'    to load a list of targets from a CSV file.
+#
+$RunMode = 'Single'
+
+# Path to the CSV file used when $RunMode = 'Csv'.
+$TargetCsvPath = 'C:\Diag\zfp_targets.csv'
+
+# Maximum number of targets to test at the same time in Csv mode.
+# Uses Start-Job (separate PowerShell processes) for true parallelism in PS 5.1.
+# Set to 1 to run targets one at a time (sequential — easier to read console output).
+# Recommended range: 1-5. High values can saturate RPC/SMB on busy networks.
+$MaxParallelJobs = 3
+
+<#
+  ── CSV FILE FORMAT ──────────────────────────────────────────────────────────────
+  Save as UTF-8 with headers on the first row.
+  Column names are case-insensitive.
+
+  REQUIRED column:
+    ComputerName        Hostname, FQDN, or IP of the Windows target to scan.
+
+  OPTIONAL columns (leave the cell blank to inherit the value from the config block):
+    BeaconHostname      Override the beacon server for this target.
+    UploadServer        Override the upload/ManageSoftRL server for this target.
+    UploadProtocol      'http' or 'https'  (default: value of $UploadProtocol above)
+    UploadPort          Port number        (default: value of $UploadPort above)
+    ReportPath          Full file path override for this target's report.
+                        Overrides the auto-named file in $ReportOutputDir for this row.
+
+  Reports are automatically saved to $ReportOutputDir as YYYY-MM-DD_<ComputerName>.html
+  (or .csv if $ReportFormat = 'CSV'). All targets share the single credential set in
+  $CredentialUsername above (or the current user context if left empty).
+
+  EXAMPLE:
+    ComputerName,BeaconHostname,UploadServer,UploadProtocol,UploadPort,ReportPath
+    WORKSTATION01,,,,,
+    WORKSTATION02,BEACON02,BEACON02,http,80,
+    10.10.5.50,,,,,C:\Diag\server50.html
+  ─────────────────────────────────────────────────────────────────────────────────
+#>
 
 #endregion ── END USER CONFIGURATION ─────────────────────────────────────────────
 
@@ -86,6 +161,17 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 #region ── DERIVED VARIABLES & STATE ─────────────────────────────────────────────────────
+
+# Apply per-target overrides when running as a CSV batch job subprocess.
+# These are set via the param() block at the top; the orchestrator passes them.
+if ($_IsBatchJob) {
+    if ($_CsvTargetComputer -ne '')  { $TargetComputer   = $_CsvTargetComputer }
+    if ($_CsvBeaconHostname -ne '')  { $BeaconHostname   = $_CsvBeaconHostname }
+    if ($_CsvUploadServer   -ne '')  { $UploadServer     = $_CsvUploadServer   }
+    if ($_CsvUploadProtocol -ne '')  { $UploadProtocol   = $_CsvUploadProtocol }
+    if ($_CsvUploadPort     -ne '')  { $UploadPort       = [int]$_CsvUploadPort }
+    if ($_CsvHtmlReportPath -ne '')  { $HtmlReportPath   = $_CsvHtmlReportPath }
+}
 
 # Build the full UploadLocation URL from the config values above.
 $defaultPort = (($UploadProtocol -eq 'https') -and ($UploadPort -eq 443)) -or (($UploadProtocol -eq 'http') -and ($UploadPort -eq 80))
@@ -100,11 +186,23 @@ $UploadTestURL  = "$UploadLocation/test"
 # Build the full ndtrack UNC path.
 $NdtrackUNC     = "\\$BeaconHostname\mgsRET`$\$NdtrackRelativePath"
 
-# Admin$ path used for reading captured output files off the target.
-$DiagDirRemoteAdmin = $RemoteDiagDir -replace '^C:\\Windows\\', "\\$TargetComputer\Admin`$\"
+# C$ path used for reading captured output files off the target.
+$DiagDirRemoteAdmin = $RemoteDiagDir -replace '^C:\\', "\\$TargetComputer\C`$\"
 
-# Prompt for password if a username was supplied; otherwise run as current user.
-if ($CredentialUsername -ne '') {
+# Credential resolution — three paths:
+#   1. Running as a batch job subprocess: credential was DPAPI-serialised by the orchestrator
+#      and passed via $_CsvCredPass. Deserialise it here (DPAPI works within same user context).
+#   2. Interactive single/csv mode with a username configured: prompt once.
+#   3. No username: run as the current user (no prompt).
+if ($_IsBatchJob -and $_CsvCredPass -ne '') {
+    try {
+        $secPass    = $_CsvCredPass | ConvertTo-SecureString   # DPAPI decrypt (same user session)
+        $Credential = [PSCredential]::new($_CsvCredUser, $secPass)
+    } catch {
+        Write-Warning "Could not deserialise credential in batch job — running as current user. Error: $($_.Exception.Message)"
+        $Credential = $null
+    }
+} elseif ($CredentialUsername -ne '') {
     $Credential = Get-Credential -UserName $CredentialUsername `
                                  -Message "Enter password for $CredentialUsername (used for Admin$ and WMI access to $TargetComputer)"
 } else {
@@ -112,7 +210,6 @@ if ($CredentialUsername -ne '') {
 }
 
 $Script:Results      = [System.Collections.Generic.List[PSObject]]::new()
-$Script:AdminDrive   = $null   # PSDrive letter if Admin$ is mapped
 $Script:CimSession   = $null   # Reusable CIM session
 
 $PASS  = 'PASS'
@@ -177,31 +274,23 @@ function Add-Result {
 
 <#
 .DESCRIPTION
-    Returns a CIM session to the target, trying WSMan (WinRM) first then DCOM fallback.
+    Returns a CIM session to the target using DCOM exclusively.
     Session is cached in $Script:CimSession.
-    IMPROVEMENT: CIM over WSMan is faster and less firewall-sensitive than raw DCOM;
-                 the automatic fallback means one function works in both environments.
+    WinRM/WSMan is intentionally not used — Flexera Beacon uses DCOM (Win32_Process.Create)
+    and a WSMan-only success would be a false PASS.
 #>
 function Get-TargetCimSession {
     if ($Script:CimSession -and $Script:CimSession.TestConnection()) {
         return $Script:CimSession
     }
-
     $cimOpts = @{ ComputerName = $TargetComputer; ErrorAction = 'Stop' }
     if ($Credential) { $cimOpts['Credential'] = $Credential }
 
-    # Try WSMan first (port 5985), then DCOM
-    foreach ($proto in @('Wsman', 'Dcom')) {
-        try {
-            $sessionOpt = New-CimSessionOption -Protocol $proto
-            $cimOpts['SessionOption'] = $sessionOpt
-            $Script:CimSession = New-CimSession @cimOpts
-            return $Script:CimSession
-        } catch {
-            # Try next protocol
-        }
-    }
-    throw "Unable to establish CIM session via WSMan or DCOM to $TargetComputer"
+    # DCOM only — matches the transport Flexera Beacon uses for Win32_Process.Create.
+    # WinRM/WSMan is intentionally not used or tested.
+    $cimOpts['SessionOption'] = New-CimSessionOption -Protocol Dcom
+    $Script:CimSession = New-CimSession @cimOpts
+    return $Script:CimSession
 }
 
 <#
@@ -288,6 +377,7 @@ function Invoke-RemoteCapturedProcess {
     if ($launchResult.ReturnCode -ne 0) {
         return [PSCustomObject]@{
             Launched    = $false
+            TimedOut    = $false
             LaunchError = "$($launchResult.ReturnText) | $($launchResult.Error)"
             StdoutFile  = $stdoutFile
             StderrFile  = $stderrFile
@@ -296,19 +386,26 @@ function Invoke-RemoteCapturedProcess {
         }
     }
 
-    # Poll for process exit (avoid indefinite hang)
-    $deadline = [datetime]::UtcNow.AddSeconds($TimeoutSec)
-    do {
-        Start-Sleep -Seconds 3
-        try {
-            $session = Get-TargetCimSession
-            $running = Get-CimInstance -CimSession $session -ClassName Win32_Process `
-                       -Filter "ProcessId = $($launchResult.ProcessId)" -ErrorAction SilentlyContinue
-        } catch { $running = $null }
-    } while ($running -and [datetime]::UtcNow -lt $deadline)
+    # Poll for process exit (avoid indefinite hang).
+    # Guard: only poll if ProcessId is valid (> 0); a PID of 0 is the System Idle process.
+    $timedOut = $false
+    if ($launchResult.ProcessId -gt 0) {
+        $deadline = [datetime]::UtcNow.AddSeconds($TimeoutSec)
+        do {
+            Start-Sleep -Seconds 3
+            try {
+                $session = Get-TargetCimSession
+                $running = Get-CimInstance -CimSession $session -ClassName Win32_Process `
+                           -Filter "ProcessId = $($launchResult.ProcessId)" -ErrorAction SilentlyContinue
+            } catch { $running = $null }
+        } while ($running -and [datetime]::UtcNow -lt $deadline)
+
+        if ($running) { $timedOut = $true }
+    }
 
     return [PSCustomObject]@{
         Launched    = $true
+        TimedOut    = $timedOut
         LaunchError = $null
         StdoutFile  = $stdoutFile
         StderrFile  = $stderrFile
@@ -339,25 +436,24 @@ function Use-AdminShareDrive {
         if (-not (Get-PSDrive -Name $driveLetter -ErrorAction SilentlyContinue)) {
             New-PSDrive @mapArgs | Out-Null
         }
-        $Script:AdminDrive = "${driveLetter}:"
         return (& $Action)
     } finally {
         if (Get-PSDrive -Name $driveLetter -ErrorAction SilentlyContinue) {
             Remove-PSDrive -Name $driveLetter -Force -ErrorAction SilentlyContinue
-            $Script:AdminDrive = $null
         }
     }
 }
 
 <#
 .DESCRIPTION
-    Reads a remote file back via Admin$ (C:\Windows\... → \\Target\Admin$\...).
+    Reads a remote file back via C$ (C:\... → \\Target\C$\...).
+    Uses C$ rather than Admin$ so $RemoteDiagDir can be outside C:\Windows\.
     Returns the content as a string, or $null on failure.
 #>
 function Read-RemoteTextViaAdmin {
     param([string]$RemotePath)   # e.g. C:\Windows\Temp\FlexeraZFPDiag\foo.txt
-    $relative = $RemotePath -replace '^C:\\Windows\\', ''
-    $unc      = "\\$TargetComputer\Admin$\$relative"
+    $relative = $RemotePath -replace '^C:\\', ''
+    $unc      = "\\$TargetComputer\C$\$relative"
     try {
         return (Get-Content -LiteralPath $unc -Raw -ErrorAction Stop)
     } catch {
@@ -539,14 +635,17 @@ function Test-AdminShareRW {
 
 function Test-CShareRead {
     # C$ read confirms broad admin share access (used for log tailing)
-    $path = "\\$TargetComputer\C$\Windows\System32\cmd.exe"
+    $path   = "\\$TargetComputer\C$\Windows\System32\cmd.exe"
+    $stream = $null
     try {
-        $null = [IO.File]::OpenRead($path)
+        $stream = [IO.File]::OpenRead($path)
         Add-Result -Category 'SMB' -Test 'C$ share readable' -Result $PASS -Detail $path
     } catch {
         Add-Result -Category 'SMB' -Test 'C$ share readable' -Result $WARN `
             -Detail $_.Exception.Message `
             -Hint 'C$ access is needed for log tailing. Not strictly required for ZFP itself.'
+    } finally {
+        if ($stream) { $stream.Dispose() }
     }
 }
 
@@ -566,7 +665,7 @@ function Test-RemoteExecution {
     } catch {
         Add-Result -Category 'WMI/CIM' -Test 'CIM session established' -Result $FAIL `
             -Detail $_.Exception.Message `
-            -Hint 'Ensure TCP 135 is open, DCOM/WMI service is running, and credentials are valid.'
+            -Hint 'Ensure TCP 135 (RPC Endpoint Mapper) and dynamic RPC ports (typically 49152-65535) are open. Verify DCOM/WMI service is running and credentials are valid.'
         return  # Nothing further will work
     }
 
@@ -583,8 +682,8 @@ function Test-RemoteExecution {
         return
     }
 
-    # Poll via Admin$ until the directory appears (up to 15 seconds)
-    $diagDirAdminPath = $RemoteDiagDir -replace '^C:\\Windows\\', "\\$TargetComputer\Admin`$\"
+    # Poll via C$ until the directory appears (up to 15 seconds)
+    $diagDirAdminPath = $RemoteDiagDir -replace '^C:\\', "\\$TargetComputer\C`$\"
     $dirReady  = $false
     $dirDeadline = [datetime]::UtcNow.AddSeconds(15)
     do {
@@ -599,8 +698,8 @@ function Test-RemoteExecution {
             -Detail "Win32_Process.Create returned 0 — diag dir confirmed at $RemoteDiagDir"
     } else {
         Add-Result -Category 'WMI/CIM' -Test 'Remote process creation (smoke test)' -Result $WARN `
-            -Detail "Process launched but diag dir not visible via Admin$ after 15s — output capture may fail" `
-            -Hint   "Check Admin$ access. Dir may still exist on target but Admin$ credentials may lack read access."
+            -Detail "Process launched but diag dir not visible via C$ after 15s — output capture may fail" `
+            -Hint   "Check C$ access. Dir may still exist on target but credentials may lack C$ read access."
     }
 
 }
@@ -626,17 +725,26 @@ function Test-TargetSideDNS {
             -Hint 'Remote process creation failed before DNS could be tested.'
         return
     }
-    $out = Read-RemoteTextViaAdmin -RemotePath $proc.StdoutFile
-    $err = Read-RemoteTextViaAdmin -RemotePath $proc.StderrFile
-    $exit= Read-RemoteTextViaAdmin -RemotePath $proc.ExitFile
+    if ($proc.TimedOut) {
+        Add-Result -Category 'Target→DNS' -Test "Resolve BeaconHost ($BeaconHostname)" `
+            -Result $WARN -Detail 'nslookup launched but did not exit within 30s (timed out)' `
+            -Hint 'DNS query may be hanging. Check DNS server reachability from target.'
+        return
+    }
+    $out  = Read-RemoteTextViaAdmin -RemotePath $proc.StdoutFile
+    $err  = Read-RemoteTextViaAdmin -RemotePath $proc.StderrFile
+    $exit = $null; $rawExit = Read-RemoteTextViaAdmin -RemotePath $proc.ExitFile; if ($rawExit) { $exit = $rawExit.Trim() }
 
-    if ($out -match 'Address:') {
+    # nslookup exits 0 and prints "Address:" when resolution succeeds.
+    # Require both the exit code and the address line to avoid false PASS from the
+    # default-server line that nslookup always prints before querying.
+    if ($exit -eq '0' -and $out -match 'Address:') {
         Add-Result -Category 'Target→DNS' -Test "Resolve BeaconHost ($BeaconHostname)" `
             -Result $PASS -Detail (($out -split "`n" | Select-Object -Last 3) -join ' | ')
     } else {
         Add-Result -Category 'Target→DNS' -Test "Resolve BeaconHost ($BeaconHostname)" `
             -Result $FAIL `
-            -Detail "stdout: $(if ($out) { $out.Trim() }) | stderr: $(if ($err) { $err.Trim() })" `
+            -Detail "Exit $exit | stdout: $(if ($out) { $out.Trim() }) | stderr: $(if ($err) { $err.Trim() })" `
             -Hint "Target cannot resolve '$BeaconHostname'. Check DNS on the target or add a hosts entry."
     }
 }
@@ -649,6 +757,12 @@ function Test-TargetUNCRead {
         Add-Result -Category 'Target→UNC' -Test 'Read ndtrack.exe from Beacon share' `
             -Result $FAIL -Detail "Launch failed: $($proc.LaunchError)" `
             -Hint 'Remote process creation failed before UNC test could run.'
+        return
+    }
+    if ($proc.TimedOut) {
+        Add-Result -Category 'Target→UNC' -Test 'Read ndtrack.exe from Beacon share' `
+            -Result $WARN -Detail 'dir command launched but did not exit within 45s (timed out)' `
+            -Hint 'UNC access may be hanging. Check SMB connectivity from target to Beacon.'
         return
     }
     $out  = Read-RemoteTextViaAdmin -RemotePath $proc.StdoutFile
@@ -673,7 +787,7 @@ function Test-TargetHTTPUploadLocation {
     # handled consistently with all other target-side tests.
 
     $scriptPath      = "$RemoteDiagDir\http_test.ps1"
-    $scriptAdminPath = $scriptPath -replace '^C:\\Windows\\', "\\$TargetComputer\Admin`$\"
+    $scriptAdminPath = $scriptPath -replace '^C:\\', "\\$TargetComputer\C`$\"
 
     # Prefix output lines with STATUS:/ERROR: so we can parse them without
     # relying on fragile line-number or regex matching of raw HTTP status codes.
@@ -708,6 +822,12 @@ try {
         Add-Result -Category 'Target→HTTP' -Test 'Reach UploadLocation (/test)' `
             -Result $FAIL -Detail "Launch failed: $($proc.LaunchError)" `
             -Hint 'Remote process creation failed before HTTP test could run.'
+        return
+    }
+    if ($proc.TimedOut) {
+        Add-Result -Category 'Target→HTTP' -Test 'Reach UploadLocation (/test)' `
+            -Result $WARN -Detail 'PowerShell HTTP test launched but did not exit within 45s (timed out)' `
+            -Hint "HTTP connection to $UploadTestURL may be hanging. Check firewall rules between target and Beacon."
         return
     }
 
@@ -763,7 +883,6 @@ function Invoke-NdtrackUNC {
     }
 
     # Launch ndtrack with the correct -t Machine -o argument syntax.
-    # Timeout is 180 seconds — ndtrack can take 1-2 minutes to complete a scan.
     # NdtrackUNC is intentionally NOT quoted — UNC paths have no spaces so quotes are
     # unnecessary, and cmd /c mangles the command when it starts with a quoted token
     # AND contains additional quoted pairs (like UploadLocation="...").
@@ -780,6 +899,13 @@ function Invoke-NdtrackUNC {
         return
     }
 
+    if ($proc.TimedOut) {
+        Add-Result -Category 'ndtrack' -Test 'UNC launch (Beacon-style)' -Result $WARN `
+            -Detail 'Process launched but did not exit within 300s (timed out)' `
+            -Hint 'ndtrack is still running or hung. Check tracker.log for progress.'
+        return
+    }
+
     $stdout = Read-RemoteTextViaAdmin -RemotePath $proc.StdoutFile
     $stderr = Read-RemoteTextViaAdmin -RemotePath $proc.StderrFile
     $exit   = $null; $rawExit1 = Read-RemoteTextViaAdmin -RemotePath $proc.ExitFile; if ($rawExit1) { $exit = $rawExit1.Trim() }
@@ -791,8 +917,8 @@ function Invoke-NdtrackUNC {
         Add-Result -Category 'ndtrack' -Test 'UNC launch (Beacon-style)' -Result $PASS -Detail $detail
     } elseif ($null -eq $exit) {
         Add-Result -Category 'ndtrack' -Test 'UNC launch (Beacon-style)' -Result $WARN `
-            -Detail 'Process launched but exit code not captured (timeout?)' `
-            -Hint 'ndtrack may still be running or timed out. Check tracker.log.'
+            -Detail 'Process launched but exit code not captured' `
+            -Hint 'ndtrack output files may not be readable. Check Admin$/C$ access.'
     } else {
         Add-Result -Category 'ndtrack' -Test 'UNC launch (Beacon-style)' `
             -Result $FAIL -Detail $detail `
@@ -828,7 +954,7 @@ function Invoke-NdtrackLocalStaged {
 
     # Stage: copy ndtrack.exe from Beacon share to target via Admin$
     $localExe = "$RemoteDiagDir\ndtrack_staged.exe"
-    $adminDest = $localExe -replace '^C:\\Windows\\', "\\$TargetComputer\Admin$\"
+    $adminDest = $localExe -replace '^C:\\', "\\$TargetComputer\C`$\"
 
     try {
         Use-AdminShareDrive {
@@ -847,6 +973,19 @@ function Invoke-NdtrackLocalStaged {
     $ndArgs = "-t Machine -o UploadLocation=`"$UploadLocation`" $NdtrackExtraArgs"
     $proc   = Invoke-RemoteCapturedProcess -Tag 'ndtrack_local' `
                   -InnerCommand "`"$localExe`" $ndArgs" -TimeoutSec 300
+
+    if (-not $proc.Launched) {
+        Add-Result -Category 'ndtrack' -Test 'Staged local run' `
+            -Result $FAIL -Detail "Launch failed: $($proc.LaunchError)" `
+            -Hint 'Win32_Process.Create could not launch staged exe. Check DCOM permissions.'
+        return
+    }
+    if ($proc.TimedOut) {
+        Add-Result -Category 'ndtrack' -Test 'Staged local run' -Result $WARN `
+            -Detail 'ndtrack launched but did not exit within 300s (timed out)' `
+            -Hint 'ndtrack is still running or hung. Check tracker.log for progress.'
+        return
+    }
 
     $stdout = Read-RemoteTextViaAdmin -RemotePath $proc.StdoutFile
     $stderr = Read-RemoteTextViaAdmin -RemotePath $proc.StderrFile
@@ -924,12 +1063,71 @@ function Write-SummaryTable {
 
 #endregion
 
-#region ── HTML REPORT ───────────────────────────────────────────────────────────
+#region ── REPORT OUTPUT ─────────────────────────────────────────────────────────
 
 <#
 .DESCRIPTION
-    IMPROVEMENT: HTML report output so results can be shared with firewall / network
-    teams without them needing PowerShell access.
+    Resolves the final output path for the diagnostic report.
+    Priority:
+      1. $HtmlReportPath if explicitly set (single-target override)
+      2. Auto-generated YYYY-MM-DD_<ComputerName>.<ext> in $ReportOutputDir
+      3. $null if $ReportOutputDir is empty (no report)
+    When the target directory does not exist, prompts the user for permission before
+    creating it (suppressed in batch job mode — permission was granted interactively).
+#>
+function Resolve-ReportPath {
+    # Explicit override always wins
+    if ($HtmlReportPath) { return $HtmlReportPath }
+
+    # No directory configured — no report
+    if (-not $ReportOutputDir) { return $null }
+
+    # Create the directory if missing
+    if (-not (Test-Path -LiteralPath $ReportOutputDir -ErrorAction SilentlyContinue)) {
+        if (-not $_IsBatchJob) {
+            Write-Host ""
+            $answer = Read-Host "  Report directory '$ReportOutputDir' does not exist. Create it? [Y/N]"
+            if ($answer -notmatch '^[Yy]') {
+                Write-Host "  Skipping report — directory not created." -ForegroundColor Yellow
+                return $null
+            }
+        }
+        try {
+            New-Item -Path $ReportOutputDir -ItemType Directory -Force -ErrorAction Stop | Out-Null
+            Write-Host "  Created report directory: $ReportOutputDir" -ForegroundColor Cyan
+        } catch {
+            Write-Warning "Could not create report directory '$ReportOutputDir': $($_.Exception.Message)"
+            return $null
+        }
+    }
+
+    $ext      = if ($ReportFormat -eq 'CSV') { 'csv' } else { 'html' }
+    $date     = Get-Date -Format 'yyyy-MM-dd'
+    $safeName = $TargetComputer -replace '[\\/:*?"<>|]', '_'
+    return Join-Path $ReportOutputDir "${date}_${safeName}.${ext}"
+}
+
+<#
+.DESCRIPTION
+    Exports $Script:Results to a CSV file.
+    Used as the primary output when $ReportFormat = 'CSV', and as a fallback
+    when HTML generation fails.
+#>
+function Export-CsvReport {
+    param([string]$Path)
+    try {
+        $Script:Results | Export-Csv -LiteralPath $Path -NoTypeInformation -Encoding UTF8 -ErrorAction Stop
+        Write-Host "`n  CSV report saved: $Path" -ForegroundColor Cyan
+    } catch {
+        Write-Warning "Could not write CSV report to '$Path' — $($_.Exception.Message)"
+    }
+}
+
+<#
+.DESCRIPTION
+    Exports $Script:Results as a dark-themed HTML file suitable for sharing with
+    firewall / network teams. Throws on write failure so the caller can fall back
+    to CSV automatically.
 #>
 function Export-HtmlReport {
     param([string]$Path)
@@ -972,12 +1170,9 @@ $($rows -join "`n")
 </tbody></table>
 </body></html>
 "@
-    try {
-        [IO.File]::WriteAllText($Path, $html)
-        Write-Host "`n  HTML report saved: $Path" -ForegroundColor Cyan
-    } catch {
-        Write-Warning "Could not write HTML report to $Path — $($_.Exception.Message)"
-    }
+    # Let exceptions propagate — caller catches and falls back to CSV.
+    [IO.File]::WriteAllText($Path, $html)
+    Write-Host "`n  HTML report saved: $Path" -ForegroundColor Cyan
 }
 
 #endregion
@@ -985,7 +1180,15 @@ $($rows -join "`n")
 #region ── CLEANUP ───────────────────────────────────────────────────────────────
 
 function Invoke-Cleanup {
+    # Remove the remote diag directory and all captured output files.
+    # Uses Invoke-RemoteCimProcess so it works even if C$ is unavailable.
+    # Fires-and-forgets — we do not poll for completion.
     if ($Script:CimSession) {
+        try {
+            $cleanCmd = "C:\Windows\System32\cmd.exe /c rmdir /s /q `"$RemoteDiagDir`""
+            Invoke-RemoteCimProcess -CommandLine $cleanCmd -Description 'cleanup diag dir' | Out-Null
+        } catch {}
+
         try { Remove-CimSession -CimSession $Script:CimSession -ErrorAction SilentlyContinue } catch {}
         $Script:CimSession = $null
     }
@@ -1057,9 +1260,21 @@ function Test-FlexeraZFARequirements {
     Write-SummaryTable
     Get-RemediationHints
 
-    # ── HTML report
-    if ($HtmlReportPath) {
-        Export-HtmlReport -Path $HtmlReportPath
+    # ── Report output
+    $reportPath = Resolve-ReportPath
+    if ($reportPath) {
+        if ($ReportFormat -eq 'CSV') {
+            Export-CsvReport -Path $reportPath
+        } else {
+            # Try HTML; fall back to CSV if the write fails (permissions, disk full, etc.)
+            try {
+                Export-HtmlReport -Path $reportPath
+            } catch {
+                $csvFallback = [IO.Path]::ChangeExtension($reportPath, 'csv')
+                Write-Warning "HTML report failed ('$($_.Exception.Message)') — falling back to CSV: $csvFallback"
+                Export-CsvReport -Path $csvFallback
+            }
+        }
     }
 
     # ── Return results object for pipeline use
@@ -1069,4 +1284,173 @@ function Test-FlexeraZFARequirements {
 #endregion
 
 # ── ENTRY POINT ──────────────────────────────────────────────────────────────────
-Test-FlexeraZFARequirements
+#
+# Routing logic:
+#   $_IsBatchJob = $true   → This instance was spawned by the CSV orchestrator.
+#                            Run single-target mode immediately (no orchestration).
+#   $RunMode = 'Single'    → Interactive single-target run. Run once and exit.
+#   $RunMode = 'Csv'       → Load CSV and run each target — sequentially if
+#                            $MaxParallelJobs -le 1, or in parallel via Start-Job.
+#
+
+if ($_IsBatchJob -or $RunMode -eq 'Single') {
+    # ── SINGLE TARGET MODE (also used by each parallel batch job subprocess) ──────
+    Test-FlexeraZFARequirements
+
+} elseif ($RunMode -eq 'Csv') {
+    # ── CSV MULTI-TARGET MODE ─────────────────────────────────────────────────────
+
+    if (-not (Test-Path -LiteralPath $TargetCsvPath -ErrorAction SilentlyContinue)) {
+        Write-Error "CSV file not found: $TargetCsvPath"
+        exit 1
+    }
+
+    $csvRows = Import-Csv -LiteralPath $TargetCsvPath
+    if (-not $csvRows) {
+        Write-Error "CSV file is empty or could not be parsed: $TargetCsvPath"
+        exit 1
+    }
+
+    # Validate that ComputerName column exists
+    $firstRow = $csvRows | Select-Object -First 1
+    if (-not ($firstRow.PSObject.Properties.Name -contains 'ComputerName')) {
+        Write-Error "CSV must have a 'ComputerName' column. Found columns: $($firstRow.PSObject.Properties.Name -join ', ')"
+        exit 1
+    }
+
+    $targets = $csvRows | Where-Object { $_.ComputerName -and $_.ComputerName.Trim() -ne '' }
+    Write-Host "`nCSV loaded: $($targets.Count) target(s) from $TargetCsvPath" -ForegroundColor Cyan
+
+    # ── Serialise credential once so batch jobs can reuse it without re-prompting ──
+    # DPAPI (ConvertFrom-SecureString with no key) encrypts using the current Windows
+    # user account. The spawned jobs run under the same user, so they can decrypt it.
+    $serialisedCredUser = ''
+    $serialisedCredPass = ''
+    if ($Credential) {
+        $serialisedCredUser = $Credential.UserName
+        $serialisedCredPass = $Credential.Password | ConvertFrom-SecureString   # DPAPI encrypt
+    }
+
+    # ── Ensure report output directory exists (ask once, before spawning any jobs) ──
+    if ($ReportOutputDir -and -not (Test-Path -LiteralPath $ReportOutputDir -ErrorAction SilentlyContinue)) {
+        $answer = Read-Host "`n  Report directory '$ReportOutputDir' does not exist. Create it? [Y/N]"
+        if ($answer -match '^[Yy]') {
+            try {
+                New-Item -Path $ReportOutputDir -ItemType Directory -Force -ErrorAction Stop | Out-Null
+                Write-Host "  Created report directory: $ReportOutputDir" -ForegroundColor Cyan
+            } catch {
+                Write-Warning "Could not create '$ReportOutputDir': $($_.Exception.Message). Reports will be skipped."
+            }
+        } else {
+            Write-Host "  Reports will be skipped — directory not created." -ForegroundColor Yellow
+        }
+    }
+
+    # ── Helper: build argument list for a single target row ───────────────────────
+    function Build-TargetArgs {
+        param($row)
+
+        function Get-Col { param($r, $name)
+            $prop = $r.PSObject.Properties | Where-Object { $_.Name -ieq $name } | Select-Object -First 1
+            if ($prop) { return $prop.Value } else { return '' }
+        }
+
+        # Per-row ReportPath override; if blank, Resolve-ReportPath in the subprocess
+        # will auto-name using $ReportOutputDir (passed through as the config default).
+        $reportPath = (Get-Col $row 'ReportPath').Trim()
+
+        return @{
+            _CsvTargetComputer  = $row.ComputerName.Trim()
+            _CsvBeaconHostname  = (Get-Col $row 'BeaconHostname').Trim()
+            _CsvUploadServer    = (Get-Col $row 'UploadServer').Trim()
+            _CsvUploadProtocol  = (Get-Col $row 'UploadProtocol').Trim()
+            _CsvUploadPort      = (Get-Col $row 'UploadPort').Trim()
+            _CsvHtmlReportPath  = $reportPath
+            _CsvCredUser        = $serialisedCredUser
+            _CsvCredPass        = $serialisedCredPass
+        }
+    }
+
+    $scriptPath = $PSCommandPath   # Full path to this script file
+
+    if ($MaxParallelJobs -le 1) {
+        # ── SEQUENTIAL ────────────────────────────────────────────────────────────
+        Write-Host "Running sequentially (MaxParallelJobs = $MaxParallelJobs)" -ForegroundColor DarkCyan
+        foreach ($row in $targets) {
+            $args = Build-TargetArgs $row
+            Write-Host "`n═══ TARGET: $($args._CsvTargetComputer) ═══" -ForegroundColor Cyan
+            & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass `
+                -File $scriptPath `
+                -_CsvTargetComputer $args._CsvTargetComputer `
+                -_CsvBeaconHostname $args._CsvBeaconHostname `
+                -_CsvUploadServer   $args._CsvUploadServer   `
+                -_CsvUploadProtocol $args._CsvUploadProtocol `
+                -_CsvUploadPort     $args._CsvUploadPort     `
+                -_CsvHtmlReportPath $args._CsvHtmlReportPath `
+                -_CsvCredUser       $args._CsvCredUser       `
+                -_CsvCredPass       $args._CsvCredPass
+        }
+    } else {
+        # ── PARALLEL via Start-Job ────────────────────────────────────────────────
+        Write-Host "Running in parallel (MaxParallelJobs = $MaxParallelJobs)" -ForegroundColor DarkCyan
+
+        $pending  = [System.Collections.Generic.Queue[object]]::new()
+        foreach ($row in $targets) { $pending.Enqueue($row) }
+
+        $running  = [System.Collections.Generic.List[object]]::new()
+        $allJobs  = [System.Collections.Generic.List[object]]::new()
+
+        while ($pending.Count -gt 0 -or $running.Count -gt 0) {
+
+            # Fill up to MaxParallelJobs
+            while ($pending.Count -gt 0 -and $running.Count -lt $MaxParallelJobs) {
+                $row  = $pending.Dequeue()
+                $tArgs = Build-TargetArgs $row
+                $target = $tArgs._CsvTargetComputer
+
+                Write-Host "  → Starting job for $target" -ForegroundColor Cyan
+
+                $job = Start-Job -ScriptBlock {
+                    param($sp, $a)
+                    & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass `
+                        -File $sp `
+                        -_CsvTargetComputer $a._CsvTargetComputer `
+                        -_CsvBeaconHostname $a._CsvBeaconHostname `
+                        -_CsvUploadServer   $a._CsvUploadServer   `
+                        -_CsvUploadProtocol $a._CsvUploadProtocol `
+                        -_CsvUploadPort     $a._CsvUploadPort     `
+                        -_CsvHtmlReportPath $a._CsvHtmlReportPath `
+                        -_CsvCredUser       $a._CsvCredUser       `
+                        -_CsvCredPass       $a._CsvCredPass
+                } -ArgumentList $scriptPath, $tArgs
+
+                $running.Add([PSCustomObject]@{ Job = $job; Target = $target })
+                $allJobs.Add([PSCustomObject]@{ Job = $job; Target = $target })
+            }
+
+            # Check for completed jobs
+            $completed = $running | Where-Object { $_.Job.State -in @('Completed', 'Failed', 'Stopped') }
+            foreach ($item in $completed) {
+                Write-Host "`n═══ RESULTS: $($item.Target) ═══" -ForegroundColor Yellow
+                Receive-Job -Job $item.Job
+                $running.Remove($item) | Out-Null
+            }
+
+            if ($running.Count -ge $MaxParallelJobs -or ($pending.Count -eq 0 -and $running.Count -gt 0)) {
+                Start-Sleep -Seconds 5
+            }
+        }
+
+        # Final cleanup
+        $allJobs | ForEach-Object { Remove-Job -Job $_.Job -Force -ErrorAction SilentlyContinue }
+    }
+
+    Write-Host "`n═══ ALL TARGETS COMPLETE ═══" -ForegroundColor Green
+    if ($ReportOutputDir -and (Test-Path -LiteralPath $ReportOutputDir -ErrorAction SilentlyContinue)) {
+        Write-Host "  Reports saved to: $ReportOutputDir" -ForegroundColor Cyan
+    }
+
+} else {
+    Write-Error "Invalid `$RunMode value: '$RunMode'. Expected 'Single' or 'Csv'."
+    exit 1
+}
