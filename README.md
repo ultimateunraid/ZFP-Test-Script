@@ -30,6 +30,8 @@ Results are colour-coded in the console (`PASS` / `WARN` / `FAIL` / `INFO` / `SK
 - The account running the script must have local admin rights on the target, or a credential with those rights must be supplied
 - Network access from the script host to the target on TCP 135 and TCP 445
 
+> **Execution Policy**: If the current session's effective execution policy would block the script from running (`Restricted` or `AllSigned`), the script will detect this automatically and prompt you to set the policy to `Unrestricted` for the current session only. No system-wide changes are made.
+
 ---
 
 ## Quick Start
