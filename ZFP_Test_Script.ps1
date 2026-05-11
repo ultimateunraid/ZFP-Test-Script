@@ -115,6 +115,17 @@ $StageNdtrackLocally = $false
 # Set to $true to skip launching ndtrack.exe entirely (safe/read-only mode).
 $SkipNdtrackExecution = $false
 
+# Set to $true to run ndtrack via Schedule.Service COM as SYSTEM on the target (Section 5c).
+# This mirrors how mgsreservice.exe executes ndtrack during a real beacon ZFP scan:
+# SYSTEM context uses the computer account (Kerberos) for network authentication,
+# which resolves the WSAEINVAL HTTP upload failure seen with Win32_Process.Create.
+# Requires Task Scheduler service running on target; uses DCOM (same port 135 as WMI).
+$UseSystemTaskExecution = $true
+
+# Name of the scheduled task created on the target during the SYSTEM execution test.
+# Deleted automatically after the test completes or on cleanup.
+$DiagTaskName = 'FlexeraZFPDiag'
+
 # ── REPORT OUTPUT ─────────────────────────────────────────────────────────────────
 #
 # Directory where diagnostic reports are automatically saved after each run.
@@ -726,6 +737,25 @@ function Test-RemoteExecution {
             -Hint   "Check C$ access. Dir may still exist on target but credentials may lack C$ read access."
     }
 
+    # 3c. Check whether mgsreservice (ManageSoft Remote Execution) is already present on target.
+    # During a real beacon ZFP scan this service is registered temporarily and runs ndtrack as SYSTEM.
+    # Finding it here means the beacon has previously scanned this host (or cleanup failed).
+    try {
+        $cimSess = Get-TargetCimSession
+        $mgsSvc  = Get-CimInstance -CimSession $cimSess -ClassName Win32_Service -ErrorAction SilentlyContinue |
+                   Where-Object { $_.Name -match 'mgsre' -or $_.DisplayName -match 'ManageSoft Remote' -or $_.DisplayName -match 'Flexera Remote' }
+        if ($mgsSvc) {
+            Add-Result -Category 'WMI/CIM' -Test 'mgsreservice on target' -Result $INFO `
+                -Detail "Found: $($mgsSvc.Name) | State: $($mgsSvc.State) — beacon has previously run ZFP here"
+        } else {
+            Add-Result -Category 'WMI/CIM' -Test 'mgsreservice on target' -Result $INFO `
+                -Detail 'Not present — expected for a target not yet scanned by beacon'
+        }
+    } catch {
+        Add-Result -Category 'WMI/CIM' -Test 'mgsreservice on target' -Result $INFO `
+            -Detail "Service query failed: $($_.Exception.Message)"
+    }
+
 }
 
 #endregion
@@ -893,38 +923,42 @@ try {
 
 <#
 .DESCRIPTION
-    Runs ndtrack.exe from the UNC path as the Beacon would during a real ZFP scan.
-    IMPROVEMENT: Uses the captured-process helper so stdout/stderr/exit are always
-    retrievable via Admin$ regardless of whether UNC execution itself worked.
+    [5a] Runs ndtrack.exe from the UNC path via Win32_Process.Create (delegated credential
+    context) with Upload=False and MachineZeroTouchDirectory set to RemoteDiagDir.
+
+    Running Upload=False isolates the scan from the upload: a successful .ndi.gz file
+    in RemoteDiagDir proves the scan engine works regardless of upload context.
+    Separating this from the upload prevents a WSAEINVAL upload failure from masking
+    a healthy scan — the two failure modes previously looked identical.
 #>
 function Invoke-NdtrackUNC {
-    Write-Host "`n── [5] NDTRACK EXECUTION ───────────────────────────────────────" -ForegroundColor DarkCyan
+    Write-Host "`n── [5a] NDTRACK SCAN — UNC LAUNCH, Upload=False ────────────────" -ForegroundColor DarkCyan
 
     if ($SkipNdtrackExecution) {
-        Add-Result -Category 'ndtrack' -Test 'UNC launch (Beacon-style)' -Result $SKIP `
-            -Detail '-SkipNdtrackExecution was set'
+        Add-Result -Category 'ndtrack' -Test 'UNC scan (Upload=False)' -Result $SKIP `
+            -Detail '$SkipNdtrackExecution was set'
         return
     }
 
-    # Launch ndtrack with the correct -t Machine -o argument syntax.
-    # NdtrackUNC is intentionally NOT quoted — UNC paths have no spaces so quotes are
-    # unnecessary, and cmd /c mangles the command when it starts with a quoted token
-    # AND contains additional quoted pairs (like UploadLocation="...").
-    $ndCmd = "$NdtrackUNC -t Machine -o UploadLocation=`"$UploadLocation`" $NdtrackExtraArgs"
+    # Upload=False + MachineZeroTouchDirectory: scan only, no upload attempt.
+    # NdtrackUNC is intentionally NOT quoted — UNC paths contain no spaces,
+    # and cmd /c mangles the command when it starts with a quoted token that
+    # also contains additional quoted pairs (e.g. MachineZeroTouchDirectory="...").
+    $ndCmd = "$NdtrackUNC -t Machine -o Upload=False -o MachineZeroTouchDirectory=`"$RemoteDiagDir`" $NdtrackExtraArgs"
 
-    # Timeout set to 300s (5 min). Cloud provider metadata probes at 169.254.169.254
-    # each timeout at ~21s; 4+ providers = 84s of unavoidable waits before upload starts.
+    # Timeout 300s. Cloud provider metadata probes (169.254.169.254) each timeout ~21s;
+    # 4+ providers = ~84s of unavoidable dead time before the scan can complete.
     $proc = Invoke-RemoteCapturedProcess -Tag 'ndtrack_unc' -InnerCommand $ndCmd -TimeoutSec 300
 
     if (-not $proc.Launched) {
-        Add-Result -Category 'ndtrack' -Test 'UNC launch (Beacon-style)' `
+        Add-Result -Category 'ndtrack' -Test 'UNC scan (Upload=False)' `
             -Result $FAIL -Detail "Launch failed: $($proc.LaunchError)" `
             -Hint 'Win32_Process.Create could not launch UNC exe. AppLocker/WDAC/EDR may be blocking UNC execution.'
         return
     }
 
     if ($proc.TimedOut) {
-        Add-Result -Category 'ndtrack' -Test 'UNC launch (Beacon-style)' -Result $WARN `
+        Add-Result -Category 'ndtrack' -Test 'UNC scan (Upload=False)' -Result $WARN `
             -Detail 'Process launched but did not exit within 300s (timed out)' `
             -Hint 'ndtrack is still running or hung. Check tracker.log for progress.'
         return
@@ -932,41 +966,63 @@ function Invoke-NdtrackUNC {
 
     $stdout = Read-RemoteTextViaAdmin -RemotePath $proc.StdoutFile
     $stderr = Read-RemoteTextViaAdmin -RemotePath $proc.StderrFile
-    $exit   = $null; $rawExit1 = Read-RemoteTextViaAdmin -RemotePath $proc.ExitFile; if ($rawExit1) { $exit = $rawExit1.Trim() }
+    $exit   = $null
+    $rawExit1 = Read-RemoteTextViaAdmin -RemotePath $proc.ExitFile
+    if ($rawExit1) { $exit = $rawExit1.Trim() }
 
     $stdoutTrimmed = if ($stdout) { $t = $stdout.Trim(); $t.Substring(0, [Math]::Min(200, $t.Length)) } else { '' }
     $detail = "Exit $exit | stdout: $stdoutTrimmed"
 
     if ($exit -eq '0') {
-        Add-Result -Category 'ndtrack' -Test 'UNC launch (Beacon-style)' -Result $PASS -Detail $detail
+        Add-Result -Category 'ndtrack' -Test 'UNC scan (Upload=False)' -Result $PASS -Detail $detail
     } elseif ($null -eq $exit) {
-        Add-Result -Category 'ndtrack' -Test 'UNC launch (Beacon-style)' -Result $WARN `
+        Add-Result -Category 'ndtrack' -Test 'UNC scan (Upload=False)' -Result $WARN `
             -Detail 'Process launched but exit code not captured' `
             -Hint 'ndtrack output files may not be readable. Check Admin$/C$ access.'
     } else {
-        Add-Result -Category 'ndtrack' -Test 'UNC launch (Beacon-style)' `
+        Add-Result -Category 'ndtrack' -Test 'UNC scan (Upload=False)' `
             -Result $FAIL -Detail $detail `
-            -Hint 'Non-zero exit from ndtrack. Review captured stdout/stderr and tracker.log.'
+            -Hint 'Non-zero exit from ndtrack. Review tracker.log.'
+    }
+
+    # Check whether ndtrack produced an .ndi.gz inventory file.
+    # This is the definitive proof that the scan engine ran successfully — independent
+    # of any upload attempt. If the file is missing despite exit 0, the scan silently failed.
+    $diagDirUNC = $RemoteDiagDir -replace '^C:\\', "\\$TargetComputer\C`$\"
+    try {
+        $ndiFiles = @(Get-ChildItem -Path $diagDirUNC -Filter '*.ndi.gz' -ErrorAction Stop)
+        if ($ndiFiles.Count -gt 0) {
+            $ndiDetail = ($ndiFiles | ForEach-Object {
+                "$($_.Name) ($([math]::Round($_.Length / 1KB, 1)) KB)"
+            }) -join ', '
+            Add-Result -Category 'ndtrack' -Test 'NDI inventory file produced' -Result $PASS `
+                -Detail $ndiDetail
+        } else {
+            Add-Result -Category 'ndtrack' -Test 'NDI inventory file produced' -Result $FAIL `
+                -Detail 'No .ndi.gz found in RemoteDiagDir after scan completed' `
+                -Hint 'Scan did not produce an inventory file. Check tracker.log for errors.'
+        }
+    } catch {
+        Add-Result -Category 'ndtrack' -Test 'NDI inventory file produced' -Result $WARN `
+            -Detail "Could not enumerate RemoteDiagDir via C$: $($_.Exception.Message)" `
+            -Hint 'C$ access may be restricted — cannot confirm whether NDI was produced.'
     }
 
     # Print captured output
     Write-Host "`n  ndtrack stdout:" -ForegroundColor DarkGray
-    $stdoutDisplay = if ($stdout) { $stdout } else { '(empty)' }
-    Write-Host $stdoutDisplay -ForegroundColor DarkGray
+    Write-Host (if ($stdout) { $stdout } else { '(empty)' }) -ForegroundColor DarkGray
     if ($stderr) {
         Write-Host "`n  ndtrack stderr:" -ForegroundColor Yellow
         Write-Host $stderr -ForegroundColor Yellow
     }
 
-    # Show the last 20 lines of tracker.log immediately after ndtrack finishes
-    # so the result is visible without waiting for Section 6.
     Write-Host "`n  tracker.log (last 20 lines):" -ForegroundColor DarkGray
     $inlineTail = Get-RemoteTrackerLogTail -Lines 20
     if ($inlineTail) {
         Write-Host "  Source: $($inlineTail.Path)" -ForegroundColor DarkGray
         $inlineTail.Lines | ForEach-Object { Write-Host "  $_" -ForegroundColor DarkGray }
     } else {
-        Write-Host "  (tracker.log not found — ndtrack may not have written one yet)" -ForegroundColor DarkGray
+        Write-Host "  (tracker.log not found)" -ForegroundColor DarkGray
     }
 }
 
@@ -1030,6 +1086,194 @@ function Invoke-NdtrackLocalStaged {
     Invoke-RemoteCimProcess -CommandLine $cleanCmd | Out-Null
     Add-Result -Category 'ndtrack' -Test 'Cleanup staged exe' -Result $INFO `
         -Detail "Issued delete of $localExe"
+}
+
+<#
+.DESCRIPTION
+    [5c] Runs ndtrack.exe as SYSTEM on the target via Schedule.Service COM (Task Scheduler
+    DCOM, port 135 + dynamic RPC), with Upload=True and a live UploadLocation.
+
+    This mirrors the native beacon ZFP execution model:
+        Beacon → Win32_Process.Create → mgsreservice.exe (temp service, SYSTEM)
+                                              └→ ndtrack.exe (SYSTEM context)
+
+    Running as SYSTEM gives ndtrack the computer account's Kerberos token for network
+    auth — the same context the beacon uses — which avoids the WSAEINVAL failure seen
+    when ndtrack is launched under delegated credentials via Win32_Process.Create.
+
+    Comparison with Section 5a:
+        5a PASS + 5c PASS → scan and upload both work; Section 5a upload-skip was correct.
+        5a PASS + 5c FAIL → scan works but upload fails even in SYSTEM context.
+                            Likely a firewall or ManageSoftRL issue, not a context issue.
+        5a FAIL + 5c PASS → Win32_Process.Create is blocking UNC execution (AppLocker/EDR).
+                            Beacon-style launch works; direct WMI launch does not.
+        5a FAIL + 5c FAIL → fundamental connectivity or ndtrack issue independent of context.
+#>
+function Invoke-NdtrackSystemTask {
+    Write-Host "`n── [5c] NDTRACK SCAN — SYSTEM TASK (BEACON-STYLE CONTEXT) ─────" -ForegroundColor DarkCyan
+
+    if ($SkipNdtrackExecution) {
+        Add-Result -Category 'ndtrack' -Test 'SYSTEM task (Upload=True)' -Result $SKIP `
+            -Detail '$SkipNdtrackExecution was set'
+        return
+    }
+
+    if (-not $UseSystemTaskExecution) {
+        Add-Result -Category 'ndtrack' -Test 'SYSTEM task (Upload=True)' -Result $SKIP `
+            -Detail '$UseSystemTaskExecution is $false'
+        return
+    }
+
+    # Upload=True — this is the upload validation test.
+    # SYSTEM's Kerberos computer-account token should resolve WSAEINVAL.
+    $ndArgs = "-t Machine -o Upload=True -o UploadLocation=`"$UploadLocation`" $NdtrackExtraArgs"
+
+    Write-Host "  Task  : $DiagTaskName" -ForegroundColor DarkGray
+    Write-Host "  Exe   : $NdtrackUNC"  -ForegroundColor DarkGray
+    Write-Host "  Args  : $ndArgs"      -ForegroundColor DarkGray
+
+    $sched = $null
+
+    try {
+        $sched = New-Object -ComObject 'Schedule.Service'
+
+        if ($Credential) {
+            $sched.Connect($TargetComputer, $null,
+                $Credential.UserName,
+                $Credential.GetNetworkCredential().Password)
+        } else {
+            $sched.Connect($TargetComputer)
+        }
+
+        $rootFolder = $sched.GetFolder('\')
+
+        # Remove any leftover task from a previous failed run
+        try { $rootFolder.DeleteTask($DiagTaskName, 0) } catch {}
+
+        $taskDef = $sched.NewTask(0)
+        $taskDef.RegistrationInfo.Description = 'Flexera ZFP diagnostic — SYSTEM context execution test'
+
+        $taskDef.Settings.Enabled            = $true
+        $taskDef.Settings.Hidden             = $true
+        $taskDef.Settings.StartWhenAvailable = $true
+        $taskDef.Settings.ExecutionTimeLimit = 'PT300S'
+        $taskDef.Settings.MultipleInstances  = 3   # TASK_INSTANCES_STOP_EXISTING
+
+        # Principal: SYSTEM (S-1-5-18), service account logon, highest run level.
+        # LogonType 5 = TASK_LOGON_SERVICE_ACCOUNT (no password required).
+        $taskDef.Principal.UserId    = 'S-1-5-18'
+        $taskDef.Principal.LogonType = 5
+        $taskDef.Principal.RunLevel  = 1   # TASK_RUNLEVEL_HIGHEST
+
+        # Action: run ndtrack.exe directly from the beacon UNC path.
+        # SYSTEM's Kerberos token authenticates to mgsRET$ — same as mgsreservice.exe.
+        $action           = $taskDef.Actions.Create(0)   # TASK_ACTION_EXEC
+        $action.Path      = $NdtrackUNC
+        $action.Arguments = $ndArgs
+
+        # RegisterTaskDefinition flags: 6 = TASK_CREATE_OR_UPDATE
+        $task = $rootFolder.RegisterTaskDefinition(
+            $DiagTaskName,
+            $taskDef,
+            6,
+            'SYSTEM',
+            $null,
+            5   # TASK_LOGON_SERVICE_ACCOUNT
+        )
+
+        Add-Result -Category 'ndtrack' -Test 'SYSTEM task registration' -Result $PASS `
+            -Detail "Task '$DiagTaskName' registered on $TargetComputer as SYSTEM"
+
+        $null = $task.Run($null)
+        Write-Host "  Task started." -ForegroundColor Green
+
+        # Poll until task exits (state 4 = TASK_STATE_RUNNING).
+        # Brief initial pause to let Task Scheduler hand off to the process.
+        $elapsed  = 0
+        $interval = 10
+        $timedOut = $false
+        Start-Sleep -Seconds 3
+
+        Write-Host "  Polling task state (max 300s)..."
+        do {
+            Start-Sleep -Seconds $interval
+            $elapsed += $interval
+
+            try {
+                $runningTask = $rootFolder.GetTask($DiagTaskName)
+                $state       = $runningTask.State
+            } catch {
+                # Task no longer queryable — finished and may have self-removed
+                Write-Host "  Task no longer queryable — assuming complete ($elapsed s)." -ForegroundColor Green
+                break
+            }
+
+            if ($state -ne 4) {
+                $lastResult = $runningTask.LastTaskResult
+                Write-Host ("  Complete. State={0}  LastResult=0x{1:X} ({2} s)" -f $state, $lastResult, $elapsed) -ForegroundColor Green
+                break
+            }
+
+            Write-Host "  Running... ($elapsed / 300 s)"
+
+            if ($elapsed -ge 300) {
+                Write-Warning "Timeout after 300s — stopping task."
+                try { $runningTask.Stop(0) } catch {}
+                $timedOut = $true
+                break
+            }
+        } while ($true)
+
+        # Clean up task regardless of outcome
+        try { $rootFolder.DeleteTask($DiagTaskName, 0) } catch {}
+
+        if ($timedOut) {
+            Add-Result -Category 'ndtrack' -Test 'SYSTEM task (Upload=True)' -Result $WARN `
+                -Detail 'Task launched but did not complete within 300s' `
+                -Hint 'ndtrack may be hung on a metadata probe or network timeout. Check tracker.log.'
+            return
+        }
+
+        # Read tracker.log to determine upload outcome.
+        # ndtrack does not write stdout when launched by Task Scheduler, so the log
+        # is the only reliable signal.
+        $logTail = Get-RemoteTrackerLogTail -Lines 40
+        if ($logTail) {
+            $logText  = $logTail.Lines -join ' '
+            $uploaded = $logText -match 'Upload.*[Ss]uccess|[Ss]uccess.*[Uu]pload|Uploaded|UploadComplete|upload complete'
+            $failed   = $logText -match 'Upload.*[Ff]ail|[Ff]ail.*[Uu]pload|WSAEINVAL|connect fail|upload error'
+
+            Write-Host "`n  tracker.log (last 40 lines from $($logTail.Path)):" -ForegroundColor DarkGray
+            $logTail.Lines | ForEach-Object { Write-Host "  $_" -ForegroundColor DarkGray }
+
+            if ($uploaded) {
+                Add-Result -Category 'ndtrack' -Test 'SYSTEM task (Upload=True)' -Result $PASS `
+                    -Detail 'tracker.log confirms successful upload in SYSTEM context — beacon execution model validated'
+            } elseif ($failed) {
+                Add-Result -Category 'ndtrack' -Test 'SYSTEM task (Upload=True)' -Result $FAIL `
+                    -Detail 'tracker.log reports upload failure even in SYSTEM context' `
+                    -Hint 'SYSTEM context did not resolve the upload failure. Likely a firewall rule or ManageSoftRL service issue — not a credential context problem.'
+            } else {
+                Add-Result -Category 'ndtrack' -Test 'SYSTEM task (Upload=True)' -Result $WARN `
+                    -Detail 'Task completed but upload outcome unclear in tracker.log — review lines above' `
+                    -Hint 'Search tracker.log for "upload", "ManageSoftRL", or HTTP status entries.'
+            }
+        } else {
+            Add-Result -Category 'ndtrack' -Test 'SYSTEM task (Upload=True)' -Result $WARN `
+                -Detail 'Task completed but tracker.log not found — ndtrack may not have launched' `
+                -Hint 'Check Windows Event Log (Task Scheduler / Application) on target for launch errors.'
+        }
+
+    } catch {
+        Add-Result -Category 'ndtrack' -Test 'SYSTEM task (Upload=True)' -Result $FAIL `
+            -Detail "Schedule.Service COM error: $($_.Exception.Message)" `
+            -Hint 'Ensure Task Scheduler service is running on target. Requires same DCOM access as WMI (port 135 + dynamic RPC).'
+
+        # Best-effort cleanup after exception
+        if ($sched) {
+            try { $sched.GetFolder('\').DeleteTask($DiagTaskName, 0) } catch {}
+        }
+    }
 }
 
 #endregion
@@ -1216,6 +1460,22 @@ function Invoke-Cleanup {
         try { Remove-CimSession -CimSession $Script:CimSession -ErrorAction SilentlyContinue } catch {}
         $Script:CimSession = $null
     }
+
+    # Remove the diagnostic scheduled task if it was left behind (e.g. script aborted mid-run).
+    # Best-effort — silently ignore all errors.
+    if ($UseSystemTaskExecution) {
+        try {
+            $schedClean = New-Object -ComObject 'Schedule.Service'
+            if ($Credential) {
+                $schedClean.Connect($TargetComputer, $null,
+                    $Credential.UserName,
+                    $Credential.GetNetworkCredential().Password)
+            } else {
+                $schedClean.Connect($TargetComputer)
+            }
+            try { $schedClean.GetFolder('\').DeleteTask($DiagTaskName, 0) } catch {}
+        } catch {}
+    }
 }
 
 #endregion
@@ -1260,14 +1520,20 @@ function Test-FlexeraZFARequirements {
             Test-TargetHTTPUploadLocation
 
             # ── Section 5: ndtrack execution
-            Invoke-NdtrackUNC
-            Invoke-NdtrackLocalStaged
+            Invoke-NdtrackUNC          # 5a: Win32_Process.Create, Upload=False — isolates scan from upload
+            Invoke-NdtrackLocalStaged  # 5b: optional staged local copy (AppLocker/EDR bypass test)
+            Invoke-NdtrackSystemTask   # 5c: Schedule.Service COM as SYSTEM — mirrors mgsreservice.exe context
 
             # ── Section 6: Log tail
             Show-TrackerLogTail
         } else {
-            @('Target-side DNS', 'Target→UNC read', 'Target→HTTP', 'ndtrack UNC', 'ndtrack staged', 'tracker.log') |
-            ForEach-Object {
+            @(
+                'Target-side DNS', 'Target→UNC read', 'Target→HTTP',
+                'UNC scan (Upload=False)', 'NDI inventory file produced',
+                'ndtrack staged local run',
+                'SYSTEM task registration', 'SYSTEM task (Upload=True)',
+                'tracker.log'
+            ) | ForEach-Object {
                 Add-Result -Category 'Skipped' -Test $_ -Result $SKIP `
                     -Detail 'Skipped — prerequisite (remote exec or Admin$) failed'
             }
@@ -1370,7 +1636,10 @@ if ($_IsBatchJob -or $RunMode -eq 'Single') {
         }
     }
 
-    # ── Helper: build argument list for a single target row ───────────────────────
+    # ── Helper: build argument array for a single target row ──────────────────────
+    # Returns a flat array suitable for splatting to powershell.exe -File.
+    # Optional parameters are omitted when empty to avoid PS 5.1 dropping empty
+    # string arguments to native executables (which causes "missing argument" errors).
     function Build-TargetArgs {
         param($row)
 
@@ -1379,20 +1648,25 @@ if ($_IsBatchJob -or $RunMode -eq 'Single') {
             if ($prop) { return $prop.Value } else { return '' }
         }
 
-        # Per-row ReportPath override; if blank, Resolve-ReportPath in the subprocess
-        # will auto-name using $ReportOutputDir (passed through as the config default).
-        $reportPath = (Get-Col $row 'ReportPath').Trim()
+        $target         = $row.ComputerName.Trim()
+        $beaconHostname = (Get-Col $row 'BeaconHostname').Trim()
+        $uploadServer   = (Get-Col $row 'UploadServer').Trim()
+        $uploadProtocol = (Get-Col $row 'UploadProtocol').Trim()
+        $uploadPort     = (Get-Col $row 'UploadPort').Trim()
+        $reportPath     = (Get-Col $row 'ReportPath').Trim()
 
-        return @{
-            _CsvTargetComputer  = $row.ComputerName.Trim()
-            _CsvBeaconHostname  = (Get-Col $row 'BeaconHostname').Trim()
-            _CsvUploadServer    = (Get-Col $row 'UploadServer').Trim()
-            _CsvUploadProtocol  = (Get-Col $row 'UploadProtocol').Trim()
-            _CsvUploadPort      = (Get-Col $row 'UploadPort').Trim()
-            _CsvHtmlReportPath  = $reportPath
-            _CsvCredUser        = $serialisedCredUser
-            _CsvCredPass        = $serialisedCredPass
-        }
+        # _CsvTargetComputer is required; all others are optional overrides.
+        $a = [System.Collections.Generic.List[string]]::new()
+        $a.Add('-_CsvTargetComputer'); $a.Add($target)
+        if ($beaconHostname) { $a.Add('-_CsvBeaconHostname'); $a.Add($beaconHostname) }
+        if ($uploadServer)   { $a.Add('-_CsvUploadServer');   $a.Add($uploadServer)   }
+        if ($uploadProtocol) { $a.Add('-_CsvUploadProtocol'); $a.Add($uploadProtocol) }
+        if ($uploadPort)     { $a.Add('-_CsvUploadPort');     $a.Add($uploadPort)     }
+        if ($reportPath)     { $a.Add('-_CsvHtmlReportPath'); $a.Add($reportPath)     }
+        if ($serialisedCredUser) { $a.Add('-_CsvCredUser');   $a.Add($serialisedCredUser) }
+        if ($serialisedCredPass) { $a.Add('-_CsvCredPass');   $a.Add($serialisedCredPass) }
+
+        return @{ Target = $target; ArgArray = $a.ToArray() }
     }
 
     $scriptPath = $PSCommandPath   # Full path to this script file
@@ -1401,18 +1675,10 @@ if ($_IsBatchJob -or $RunMode -eq 'Single') {
         # ── SEQUENTIAL ────────────────────────────────────────────────────────────
         Write-Host "Running sequentially (MaxParallelJobs = $MaxParallelJobs)" -ForegroundColor DarkCyan
         foreach ($row in $targets) {
-            $args = Build-TargetArgs $row
-            Write-Host "`n═══ TARGET: $($args._CsvTargetComputer) ═══" -ForegroundColor Cyan
+            $built = Build-TargetArgs $row
+            Write-Host "`n═══ TARGET: $($built.Target) ═══" -ForegroundColor Cyan
             & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass `
-                -File $scriptPath `
-                -_CsvTargetComputer $args._CsvTargetComputer `
-                -_CsvBeaconHostname $args._CsvBeaconHostname `
-                -_CsvUploadServer   $args._CsvUploadServer   `
-                -_CsvUploadProtocol $args._CsvUploadProtocol `
-                -_CsvUploadPort     $args._CsvUploadPort     `
-                -_CsvHtmlReportPath $args._CsvHtmlReportPath `
-                -_CsvCredUser       $args._CsvCredUser       `
-                -_CsvCredPass       $args._CsvCredPass
+                -File $scriptPath @($built.ArgArray)
         }
     } else {
         # ── PARALLEL via Start-Job ────────────────────────────────────────────────
@@ -1428,25 +1694,17 @@ if ($_IsBatchJob -or $RunMode -eq 'Single') {
 
             # Fill up to MaxParallelJobs
             while ($pending.Count -gt 0 -and $running.Count -lt $MaxParallelJobs) {
-                $row  = $pending.Dequeue()
-                $tArgs = Build-TargetArgs $row
-                $target = $tArgs._CsvTargetComputer
+                $row   = $pending.Dequeue()
+                $built = Build-TargetArgs $row
+                $target = $built.Target
 
                 Write-Host "  → Starting job for $target" -ForegroundColor Cyan
 
                 $job = Start-Job -ScriptBlock {
-                    param($sp, $a)
+                    param($sp, $argArray)
                     & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass `
-                        -File $sp `
-                        -_CsvTargetComputer $a._CsvTargetComputer `
-                        -_CsvBeaconHostname $a._CsvBeaconHostname `
-                        -_CsvUploadServer   $a._CsvUploadServer   `
-                        -_CsvUploadProtocol $a._CsvUploadProtocol `
-                        -_CsvUploadPort     $a._CsvUploadPort     `
-                        -_CsvHtmlReportPath $a._CsvHtmlReportPath `
-                        -_CsvCredUser       $a._CsvCredUser       `
-                        -_CsvCredPass       $a._CsvCredPass
-                } -ArgumentList $scriptPath, $tArgs
+                        -File $sp @argArray
+                } -ArgumentList $scriptPath, $built.ArgArray
 
                 $running.Add([PSCustomObject]@{ Job = $job; Target = $target })
                 $allJobs.Add([PSCustomObject]@{ Job = $job; Target = $target })
